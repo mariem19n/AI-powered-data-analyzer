@@ -4,10 +4,15 @@ Toutes les valeurs sont modifiables via le fichier .env
 sans toucher au code.
 """
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore"
+    )
     # PostgreSQL
     database_url: str = "postgresql+asyncpg://analyzer:analyzer_pwd@postgres:5432/analyzer_db"
 
@@ -33,9 +38,6 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiration_minutes: int = 60
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
 
 
 settings = Settings()

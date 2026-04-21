@@ -1,20 +1,17 @@
 """
 app/semantic/extractor.py
-Semantic Layer : Business Terms Extraction.
+Semantic Layer : Business Terms Extraction — Pipeline simplifié.
 
-BusinessTermsExtractor prend une question en langage naturel
-et retourne un ExtractedTerms avec les termes métier structurés.
+Pipeline :
+  1. Pré-traitement minimal (preprocessor.py) — normalisation + alias/synonymes sûrs + fuzzy léger
+  2. Extraction LLM              — appel OpenAI GPT-4o mini avec prompt dynamique KG
+  3. Validation légère     (validator.py)     — validation sémantique / recatégorisation / plausibilité
 
-Ce composant est le SEUL appel LLM du Semantic Layer.
-La résolution dans le KG et la construction du
-SemanticContext n'appellent pas le LLM.
+Entrée  : question str (langage naturel)
+Sortie  : EnrichedTerms (termes classifiés + scores de confiance + audit trail)
 
-Usage :
-    extractor = BusinessTermsExtractor()
-    result = extractor.extract("prix Bitcoin ce mois")
-    # result.business_terms = ["prix Bitcoin"]
-    # result.entities       = ["Bitcoin"]
-    # result.time_periods   = ["ce mois"]
+L'ancienne sortie ExtractedTerms est toujours disponible via extract_raw()
+pour la rétro-compatibilité.
 """
 
 import json
@@ -22,207 +19,324 @@ import logging
 import os
 from typing import Any
 
-
-#import google.generativeai as genai
 from openai import OpenAI
 
+from app.semantic.preprocessor import Preprocessor
 from app.semantic.prompts import (
-    EXTRACTION_SYSTEM_PROMPT,
+    KGVocabulary,
+    build_extraction_prompt,
+    load_kg_vocabulary,
     EXTRACTION_USER_TEMPLATE,
 )
-from app.semantic.schemas import ExtractedTerms
+from app.semantic.schemas import (
+    EnrichedTerms,
+    ExtractedTerms,
+    PreprocessResult,
+)
+from app.semantic.validator import ExtractionValidator
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1"
-#DEFAULT_TIMEOUT = 15  # secondes
+DEFAULT_MODEL = "gpt-4o-mini"
 
 
 class BusinessTermsExtractor:
     """
-    Extrait les termes métier d'une question en langage naturel via LLM.
+    Pipeline complet d'extraction des termes métier.
 
-    première étape du Semantic Layer.
-    Entrée  : question str
-    Sortie  : ExtractedTerms (Pydantic)
-
-    Stratégie:
-      - 1er appel LLM → parse JSON → valide avec Pydantic
-      - Si JSON invalide → 1 retry avec température réduite
-      - Si retry échoue → retourne ExtractedTerms vide avec needs_clarification=True
+    Orchestre les 3 phases :
+      1. Preprocessor — nettoyage léger et correction minimale
+      2. LLM          — extraction des termes
+      3. Validator    — validation sémantique post-extraction
     """
 
-    def __init__(self):
-        api_key = os.getenv("NVIDIA_API_KEY")
+    def __init__(self, neo4j_driver=None):
+        api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise ValueError(
-                "NVIDIA_API_KEY manquant dans .env — "
-                "nécessaire pour le Semantic Layer."
-            )
-        self._model = os.getenv("SEMANTIC_LLM_MODEL", DEFAULT_MODEL)
-        print("NVIDIA key loaded:", bool(api_key), "length:", len(api_key) if api_key else 0)
-        print("Model:", self._model)
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url="https://integrate.api.nvidia.com/v1",
-        )
-        logger.info("BusinessTermsExtractor initialisé — modèle : %s", self._model)
+            raise ValueError("OPENAI_API_KEY manquant dans .env")
 
-    def extract(self, question: str) -> ExtractedTerms:
+        self._client = OpenAI(api_key=api_key)
+        self._model = os.getenv("SEMANTIC_LLM_MODEL", DEFAULT_MODEL)
+
+        self._vocab = KGVocabulary()
+        self._prompt = ""
+        self._preprocessor: Preprocessor | None = None
+        self._validator: ExtractionValidator | None = None
+
+        if neo4j_driver is not None:
+            self._reload_vocabulary(neo4j_driver)
+        else:
+            logger.warning(
+                "BusinessTermsExtractor initialisé sans neo4j_driver — "
+                "pipeline en mode dégradé (pas de pré-traitement ni validation)."
+            )
+
+        logger.info(
+            "BusinessTermsExtractor prêt — modèle : %s — "
+            "%d business_terms, %d entities, %d time_periods, %d metrics — "
+            "preprocessor: %s, validator: %s",
+            self._model,
+            len(self._vocab.business_terms),
+            len(self._vocab.entities),
+            len(self._vocab.time_periods),
+            len(self._vocab.metrics),
+            "✅" if self._preprocessor else "❌",
+            "✅" if self._validator else "❌",
+        )
+
+    def reload_vocabulary(self, neo4j_driver) -> None:
+        """Recharge le vocabulaire depuis le KG (hot reload)."""
+        self._reload_vocabulary(neo4j_driver)
+
+    def _reload_vocabulary(self, neo4j_driver) -> None:
+        self._vocab = load_kg_vocabulary(neo4j_driver)
+        self._prompt = build_extraction_prompt(self._vocab)
+        self._preprocessor = Preprocessor(self._vocab)
+        self._validator = ExtractionValidator(self._vocab)
+
+    # ─── Pipeline complet ─────────────────────────────────────
+
+    def extract(self, question: str) -> EnrichedTerms:
         """
-        Extrait les termes métier de la question.
-        Synchrone — appeler depuis un thread ou wrapper async si nécessaire.
+        Pipeline complet : pré-traitement → extraction LLM → validation.
 
         Args:
-            question: Question en langage naturel de l'utilisateur.
+            question: Question en langage naturel.
 
         Returns:
-            ExtractedTerms avec les termes structurés.
-            En cas d'échec total : ExtractedTerms vide avec needs_clarification=True.
+            EnrichedTerms avec termes classifiés, scores de confiance
+            et audit trail complet.
         """
         if not question or not question.strip():
-            logger.warning("Question vide reçue par l'extracteur.")
-            return ExtractedTerms(
-                raw_question=question,
+            return EnrichedTerms(
+                raw_question=question or "",
+                corrected_question=question or "",
                 needs_clarification=True,
             )
 
         question = question.strip()
-        logger.info("Extraction termes métier — question : %s", question[:100])
+        logger.info("Pipeline extraction — question : %s", question[:120])
 
-        # Tentative 1 — température standard
-        result = self._call_llm(question, temperature=0.0)
+        preprocess = self._run_preprocess(question)
+        extraction_input = preprocess.corrected_question if preprocess else question
+
+        if preprocess and preprocess.is_corrected:
+            logger.info(
+                "Pré-traitement — %d corrections : '%s' → '%s'",
+                len(preprocess.corrections),
+                question[:60],
+                extraction_input[:60],
+            )
+
+        raw_result = self._extract_llm(extraction_input)
+
+        if self._validator and raw_result is not None:
+            enriched = self._validator.validate(raw_result, preprocess)
+            enriched.raw_question = question
+            return enriched
+
+        if raw_result is not None:
+            return self._raw_to_enriched(raw_result, preprocess)
+
+        return EnrichedTerms(
+            raw_question=question,
+            corrected_question=extraction_input,
+            needs_clarification=True,
+            preprocessing=preprocess,
+            pipeline_confidence=0.0,
+        )
+
+    # ─── Extraction brute (rétro-compatibilité) ──────────────
+
+    def extract_raw(self, question: str) -> ExtractedTerms:
+        """
+        Extraction LLM uniquement — sans pré-traitement ni validation.
+        """
+        if not question or not question.strip():
+            return ExtractedTerms(raw_question=question or "", needs_clarification=True)
+
+        question = question.strip()
+        result = self._extract_llm(question)
         if result is not None:
             return result
 
-        # Tentative 2 — retry avec température réduite et prompt simplifié
-        logger.warning("Retry extraction LLM pour : %s", question[:100])
-        result = self._call_llm(question, temperature=0.0, is_retry=True)
-        if result is not None:
-            return result
-
-        # Fallback total
-        logger.error("Échec extraction LLM après retry — retour vide.")
         return ExtractedTerms(
             raw_question=question,
             unresolved_terms=[question],
             needs_clarification=True,
         )
 
-    def _call_llm(
-        self,
-        question: str,
-        temperature: float = 0.0,
-        is_retry: bool = False,
-    ) -> ExtractedTerms | None:
-        """
-        Appelle le LLM et parse la réponse JSON.
-        Retourne ExtractedTerms si succès, None si échec.
-        """
+    # ─── Phase 1 : Pré-traitement ────────────────────────────
+
+    def _run_preprocess(self, question: str) -> PreprocessResult | None:
+        if self._preprocessor is None:
+            return None
         try:
-            system_prompt = EXTRACTION_SYSTEM_PROMPT
+            return self._preprocessor.preprocess(question)
+        except Exception as e:
+            logger.warning("Erreur pré-traitement : %s — on continue sans", e)
+            return None
+
+    # ─── Phase 2 : Extraction LLM ────────────────────────────
+
+    def _extract_llm(self, question: str) -> ExtractedTerms | None:
+        logger.info("Extraction LLM — question : %s", question[:120])
+
+        result = self._call_llm(question)
+        if result is not None:
+            return result
+
+        logger.warning("Retry extraction pour : %s", question[:80])
+        result = self._call_llm(question, is_retry=True)
+        if result is not None:
+            return result
+
+        logger.error("Échec extraction LLM après retry.")
+        return None
+
+    def _call_llm(
+        self, question: str, is_retry: bool = False
+    ) -> ExtractedTerms | None:
+        """Appelle le LLM et parse la réponse JSON."""
+        try:
+            system = self._prompt
             if is_retry:
-                system_prompt += (
-                    "\n\nATTENTION : Ta réponse précédente était invalide. "
-                    "Réponds UNIQUEMENT avec du JSON valide, rien d'autre."
+                system += (
+                    "\n\nATTENTION : ta réponse précédente était invalide. "
+                    "Réponds UNIQUEMENT avec du JSON valide, sans markdown, sans commentaire."
                 )
+
+            if not system:
+                logger.error("Prompt vide — vocabulaire KG non chargé.")
+                return None
 
             response = self._client.chat.completions.create(
                 model=self._model,
+                max_tokens=512,
+                temperature=0.0,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": system},
                     {
                         "role": "user",
                         "content": EXTRACTION_USER_TEMPLATE.format(question=question),
                     },
                 ],
-                temperature=temperature,
-                max_tokens=512,
             )
 
-            raw_text = response.choices[0].message.content.strip()
-            logger.debug("Réponse LLM brute : %s", raw_text[:200])
+            raw = (response.choices[0].message.content or "").strip()
+            logger.debug("Réponse LLM : %s", raw[:500])
 
-            parsed = self._parse_json(raw_text)
+            parsed = self._parse_json(raw)
             if parsed is None:
                 return None
 
             return self._build_result(question, parsed)
 
         except Exception as e:
-            logger.error("Erreur NVIDIA API : %s", e)
+            logger.error("Erreur LLM (%s): %s", type(e).__name__, e)
             return None
 
-    def _parse_json(self, raw_text: str) -> dict[str, Any] | None:
-        """
-        Parse le JSON retourné par le LLM.
-        Gère les cas où le LLM ajoute des backticks malgré les instructions.
-        """
-        text = raw_text.strip()
+    def _parse_json(self, raw: str) -> dict[str, Any] | None:
+        """Parse le JSON — nettoie les backticks si présents."""
+        text = raw.strip()
 
-        # Nettoyer les backticks JSON si présents
         if text.startswith("```"):
-            lines = text.split("\n")
-            # Supprimer première ligne (```json ou ```) et dernière (```)
-            lines = [l for l in lines if not l.strip().startswith("```")]
+            lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
             text = "\n".join(lines).strip()
 
         try:
             data = json.loads(text)
-            if not isinstance(data, dict):
-                logger.warning("JSON parsé n'est pas un dict : %s", type(data))
-                return None
-            return data
+            return data if isinstance(data, dict) else None
         except json.JSONDecodeError as e:
-            logger.warning("JSON invalide — erreur : %s — texte : %s", e, text[:200])
+            logger.warning("JSON invalide : %s — texte : %s", e, text[:300])
             return None
 
-    def _build_result(self, question: str, data: dict[str, Any]) -> ExtractedTerms:
-        """
-        Construit l'ExtractedTerms depuis le dict JSON parsé.
-        Normalise et déduplique les termes.
-        """
-        def dedupe(items: list[str]) -> list[str]:
-            seen = set()
-            result = []
-            for item in items:
-                if item not in seen:
-                    seen.add(item)
-                    result.append(item)
-            return result
-        
+    def _build_result(self, question: str, data: dict) -> ExtractedTerms:
+        """Construit ExtractedTerms depuis le dict parsé."""
         def get_list(key: str) -> list[str]:
             val = data.get(key, [])
             if not isinstance(val, list):
                 return []
-            cleaned = [str(item).strip() for item in val if item and str(item).strip()]
-            return dedupe(cleaned)
+            return [str(i).strip() for i in val if i and str(i).strip()]
 
-        business_terms   = get_list("business_terms")
-        entities         = get_list("entities")
-        time_periods     = get_list("time_periods")
-        metrics          = get_list("metrics")
-        unresolved_terms = get_list("unresolved_terms")
-
-        # needs_clarification : depuis le LLM ou calculé si unresolved non vide
-        llm_needs_clarification = bool(data.get("needs_clarification", False))
-        needs_clarification = llm_needs_clarification or len(unresolved_terms) > 0
+        unresolved = get_list("unresolved_terms")
+        needs_clarif = bool(data.get("needs_clarification", False)) or bool(unresolved)
 
         result = ExtractedTerms(
             raw_question=question,
-            business_terms=business_terms,
-            entities=entities,
-            time_periods=time_periods,
-            metrics=metrics,
-            unresolved_terms=unresolved_terms,
-            needs_clarification=needs_clarification,
+            business_terms=get_list("business_terms"),
+            entities=get_list("entities"),
+            time_periods=get_list("time_periods"),
+            metrics=get_list("metrics"),
+            unresolved_terms=unresolved,
+            needs_clarification=needs_clarif,
         )
 
         logger.info(
-            "Extraction réussie — %d business_terms, %d entities, "
-            "%d time_periods, %d metrics, %d unresolved",
-            len(business_terms), len(entities),
-            len(time_periods), len(metrics), len(unresolved_terms),
+            "LLM → %d business_terms, %d entities, %d periods, %d metrics, %d unresolved",
+            len(result.business_terms),
+            len(result.entities),
+            len(result.time_periods),
+            len(result.metrics),
+            len(result.unresolved_terms),
         )
-
         return result
+
+    # ─── Conversion dégradée ──────────────────────────────────
+
+    @staticmethod
+    def _raw_to_enriched(
+        raw: ExtractedTerms,
+        preprocess: PreprocessResult | None,
+    ) -> EnrichedTerms:
+        """
+        Convertit un ExtractedTerms en EnrichedTerms minimal
+        quand le validateur n'est pas disponible.
+        """
+        from app.semantic.schemas import ClassifiedTerm, TermCategory
+
+        terms = []
+        for bt in raw.business_terms:
+            terms.append(
+                ClassifiedTerm(
+                    text=bt,
+                    category=TermCategory.BUSINESS_TERM,
+                    confidence=0.5,
+                )
+            )
+        for ent in raw.entities:
+            terms.append(
+                ClassifiedTerm(
+                    text=ent,
+                    category=TermCategory.ENTITY,
+                    confidence=0.5,
+                )
+            )
+        for tp in raw.time_periods:
+            terms.append(
+                ClassifiedTerm(
+                    text=tp,
+                    category=TermCategory.TIME_PERIOD,
+                    confidence=0.5,
+                )
+            )
+        for m in raw.metrics:
+            terms.append(
+                ClassifiedTerm(
+                    text=m,
+                    category=TermCategory.METRIC,
+                    confidence=0.5,
+                )
+            )
+
+        return EnrichedTerms(
+            raw_question=raw.raw_question,
+            corrected_question=(
+                preprocess.corrected_question if preprocess else raw.raw_question
+            ),
+            terms=terms,
+            unresolved_terms=raw.unresolved_terms,
+            needs_clarification=raw.needs_clarification,
+            preprocessing=preprocess,
+            pipeline_confidence=0.5,
+        )

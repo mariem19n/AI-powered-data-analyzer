@@ -324,6 +324,13 @@ ENTITIES = [
 BUSINESS_TERMS = [
 
     # ── Prix crypto ──────────────────────────────────────────
+    ("prix",            "crypto",
+    "Prix de clôture d'une cryptomonnaie en USD. "
+    "Terme générique qui doit être combiné avec une entité crypto "
+    "comme Bitcoin, Ethereum, Solana, etc.",
+    ["price", "cours", "valeur", "close", "closing price", "prix de clôture"],
+    "fact_crypto_daily", "close_usd"),
+
     ("prix Bitcoin",    "crypto",
      "Prix de clôture journalier du Bitcoin en USD",
      ["BTC price", "Bitcoin price", "cours Bitcoin", "valeur Bitcoin", "BTC close", "prix BTC"],
@@ -483,45 +490,54 @@ BUSINESS_RULES = [
     ("exclude_zero_volume",
      "fact_crypto_daily",
      "Exclure les jours sans volume — données manquantes ou marchés fermés",
-     "volume > 0"),
-
+     "volume > 0",
+     "sql_predicate"),
+ 
     ("active_cryptos_only",
      "dim_crypto",
      "Utiliser uniquement les cryptos actives dans le suivi",
-     "is_active = true"),
-
+     "is_active = true",
+     "sql_predicate"),
+ 
     ("valid_fred_values",
      "fact_fred_observation",
      "Exclure les observations FRED avec valeur NULL — données non encore publiées",
-     "value IS NOT NULL"),
-
+     "value IS NOT NULL",
+     "sql_predicate"),
+ 
     ("enriched_articles_only",
      "article_enrichment",
      "Pour les analyses de contenu LLM, utiliser uniquement les articles enrichis avec succès",
-     "status = 'ok'"),
-
+     "status = 'ok'",
+     "sql_predicate"),
+ 
     ("crypto_direct_sentiment",
      "agg_daily_sentiment",
      "Pour le sentiment crypto, filtrer sur les thèmes crypto_direct",
-     "keyword IN ('ECON_BITCOINS', 'ECON_CRYPTOCURRENCY')"),
-
+     "keyword IN ('ECON_BITCOINS', 'ECON_CRYPTOCURRENCY')",
+     "sql_predicate"),
+ 
     ("macro_sentiment",
      "agg_daily_sentiment",
      "Pour le sentiment macro, filtrer sur les thèmes macro",
-     "keyword IN ('ECON_CENTRALBANK', 'ECON_INFLATION', 'ECON_STOCKMARKET', 'GOV_REGULATION_FINANCIAL')"),
-
+     "keyword IN ('ECON_CENTRALBANK', 'ECON_INFLATION', 'ECON_STOCKMARKET', 'GOV_REGULATION_FINANCIAL')",
+     "sql_predicate"),
+ 
     ("use_parent_table",
      "fact_crypto_daily",
      "Toujours interroger la table parent fact_crypto_daily, "
      "jamais les partitions _btc/_eth/etc. directement. "
      "Filtrer par symbol pour cibler une crypto spécifique.",
-     "-- Correct : SELECT ... FROM fact_crypto_daily WHERE symbol = 'BTC'"),
-
+     "Utiliser fact_crypto_daily avec WHERE symbol = :symbol, "
+     "ne jamais interroger les partitions fact_crypto_daily_btc/eth/etc.",
+     "query_guideline"),
+ 
     ("market_cap_365_days_only",
      "fact_crypto_daily",
      "market_cap_usd est NULL avant les 365 derniers jours — "
      "toujours filtrer sur la période récente pour les analyses de capitalisation",
-     "date >= CURRENT_DATE - INTERVAL '365 days' AND market_cap_usd IS NOT NULL"),
+     "date >= CURRENT_DATE - INTERVAL '365 days' AND market_cap_usd IS NOT NULL",
+     "sql_predicate"),
 ]
 
 # ─── Périodes temporelles ─────────────────────────────────────

@@ -31,4 +31,5 @@ logs/
 
 node_modules/
 dist/
-build/
+build/test.py
+test.py

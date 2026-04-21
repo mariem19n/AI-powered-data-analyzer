@@ -30,3 +30,7 @@ pydantic-settings==2.5.2
 google-generativeai
 
 openai
+
+langgraph>=0.2.0
+
+httpx 

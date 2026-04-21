@@ -235,20 +235,20 @@ def create_metrics(session):
 # ─── SP1-51 : Règles métier ───────────────────────────────────
 
 def create_business_rules(session):
-    print("\n📋 Règles métier implicites (SP1-51)...")
-    for rule_id, table, description, condition in BUSINESS_RULES:
+    print("\n📋 Règles métier implicites...")
+    for rule_id, table, description, condition, rule_type in BUSINESS_RULES:
         session.run("""
             MERGE (br:BusinessRule {id: $id})
             SET br.description = $description,
                 br.condition   = $condition,
+                br.rule_type   = $rule_type,
                 br.updated_at  = datetime()
             WITH br
             MATCH (t:Table {name: $table})
             MERGE (br)-[:APPLIES_TO]->(t)
         """, id=rule_id, description=description,
-             condition=condition, table=table)
-        print(f"  ✅ {rule_id}")
-
+             condition=condition, rule_type=rule_type, table=table)
+        print(f"  ✅ {rule_id} ({rule_type})")
 
 # ─── SP1-51 : Périodes temporelles ───────────────────────────
 
