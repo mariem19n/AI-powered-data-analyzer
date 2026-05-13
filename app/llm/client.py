@@ -45,7 +45,9 @@ import json
 import logging
 import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Type, TypeVar
 
 from openai import OpenAI
@@ -64,9 +66,47 @@ DEFAULT_MAX_TOKENS = 1024
 
 
 T = TypeVar("T", bound=BaseModel)
+_request_id_var: ContextVar[str | None] = ContextVar(
+    "llm_request_id",
+    default=None,
+)
 
 
 # ─── Métriques d'utilisation ──────────────────────────────────
+
+
+@dataclass
+class LLMCallTrace:
+    """Trace d'un appel LLM individuel."""
+
+    sequence: int
+    request_id: str | None
+    purpose: str
+    model: str
+    latency_s: float
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    temperature: float
+    max_tokens: int
+    response_format: str
+    started_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "request_id": self.request_id,
+            "purpose": self.purpose,
+            "model": self.model,
+            "latency_s": round(self.latency_s, 3),
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "response_format": self.response_format,
+            "started_at": self.started_at,
+        }
 
 
 @dataclass
@@ -80,19 +120,42 @@ class LLMMetrics:
     total_completion_tokens: int = 0
     total_latency_s: float = 0.0
     calls_by_purpose: dict[str, int] = field(default_factory=dict)
+    call_traces: list[LLMCallTrace] = field(default_factory=list)
 
     def record_call(
         self,
         purpose: str,
+        model: str,
         prompt_tokens: int,
         completion_tokens: int,
         latency_s: float,
+        temperature: float,
+        max_tokens: int,
+        response_format: str,
+        started_at: str,
+        request_id: str | None,
     ) -> None:
         self.total_calls += 1
         self.total_prompt_tokens += prompt_tokens
         self.total_completion_tokens += completion_tokens
         self.total_latency_s += latency_s
         self.calls_by_purpose[purpose] = self.calls_by_purpose.get(purpose, 0) + 1
+        self.call_traces.append(
+            LLMCallTrace(
+                sequence=self.total_calls,
+                request_id=request_id,
+                purpose=purpose,
+                model=model,
+                latency_s=latency_s,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                started_at=started_at,
+            )
+        )
 
     def record_error(self) -> None:
         self.total_errors += 1
@@ -114,6 +177,15 @@ class LLMMetrics:
             "avg_latency_s": round(avg_latency, 3),
             "calls_by_purpose": dict(self.calls_by_purpose),
         }
+
+    def traces_since(self, start_index: int) -> list[dict[str, Any]]:
+        """Retourne les traces d'appels ajoutees depuis un index donne."""
+        return [trace.to_dict() for trace in self.call_traces[start_index:]]
+
+    @property
+    def trace(self) -> list[dict[str, Any]]:
+        """Alias JSON-compatible pour la trace globale."""
+        return [trace.to_dict() for trace in self.call_traces]
 
 
 # ─── Exceptions ───────────────────────────────────────────────
@@ -170,7 +242,7 @@ class LLMClient:
         self._max_retries = max_retries or int(
             os.getenv("LLM_MAX_RETRIES", DEFAULT_MAX_RETRIES)
         )
-        self._metrics = LLMMetrics()
+        self._metrics = _global_metrics
 
         logger.info(
             "LLMClient initialisé — model=%s, timeout=%ds, max_retries=%d",
@@ -220,6 +292,7 @@ class LLMClient:
 
         for attempt in range(self._max_retries + 1):
             try:
+                started_at = datetime.utcnow().isoformat()
                 t0 = time.perf_counter()
 
                 kwargs: dict[str, Any] = dict(
@@ -238,9 +311,19 @@ class LLMClient:
                 usage = response.usage
                 self._metrics.record_call(
                     purpose=purpose,
+                    model=self._model,
                     prompt_tokens=usage.prompt_tokens if usage else 0,
                     completion_tokens=usage.completion_tokens if usage else 0,
                     latency_s=latency,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    response_format=(
+                        response_format.get("type", "text")
+                        if response_format
+                        else "text"
+                    ),
+                    started_at=started_at,
+                    request_id=_request_id_var.get(),
                 )
 
                 logger.debug(
@@ -439,7 +522,18 @@ class LLMClient:
 
 # ─── Singleton ────────────────────────────────────────────────
 
+_global_metrics = LLMMetrics()
 _default_client: LLMClient | None = None
+
+
+def set_llm_request_id(request_id: str):
+    """Attache un request_id aux traces LLM du contexte courant."""
+    return _request_id_var.set(request_id)
+
+
+def reset_llm_request_id(token) -> None:
+    """Restaure le request_id LLM precedent."""
+    _request_id_var.reset(token)
 
 
 def get_llm_client() -> LLMClient:

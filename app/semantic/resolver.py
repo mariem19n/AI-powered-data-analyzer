@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from app.semantic.time_parser import TimeParser
 
 from app.semantic.schemas import (
     ClassifiedTerm,
@@ -34,6 +35,34 @@ from app.semantic.schemas import (
 logger = logging.getLogger(__name__)
 
 FUZZY_THRESHOLD = 0.80
+
+
+# ─── Helpers ──────────────────────────────────────────────────
+
+
+def _metric_prerequisites_met(
+    requires_terms: list[str] | None,
+    extracted_terms_set: set[str],
+) -> bool:
+    """
+    Vérifie qu'au moins un des prérequis d'une métrique est satisfait.
+
+    Sémantique OR : si la métrique déclare requires_terms=["sentiment",
+    "news", "media", "tone", "gdelt"], il suffit qu'AU MOINS UN de ces
+    termes soit présent dans la question pour activer la métrique.
+
+    Args:
+        requires_terms: Liste des termes qui activent la métrique.
+                        None ou vide → métrique toujours activable.
+        extracted_terms_set: Set lowercase des termes extraits par le LLM.
+
+    Returns:
+        True si la métrique peut être activée.
+    """
+    if not requires_terms:
+        return True
+    extracted_lower = extracted_terms_set or set()
+    return any(req.lower() in extracted_lower for req in requires_terms)
 
 
 # ─── Modèles de sortie ───────────────────────────────────────
@@ -69,14 +98,13 @@ class ResolvedBusinessTerm:
     description: str = ""
     domain: str = ""
 
-
 @dataclass
 class ResolvedTimePeriod:
-    """Une période temporelle résolue vers son filtre SQL."""
+    '''Une période temporelle résolue vers son filtre SQL.'''
     name: str
     sql_expression: str
     filter_expression: str
-    is_canonical: bool = True
+    is_resolved: bool = True   # True si parser ou KG a produit un filtre valide
 
 
 @dataclass
@@ -97,7 +125,6 @@ class ResolvedContext:
 
     # analytic_gaps : termes compréhensibles mais non mappables
     # techniquement dans le KG.
-    
     analytic_gaps: list[str] = field(default_factory=list)
 
     # unknown_terms : termes non interprétables, hors domaine,
@@ -108,6 +135,12 @@ class ResolvedContext:
 
     # Audit
     resolution_log: list[str] = field(default_factory=list)
+
+    # Set des termes extraits, exposé aux helpers pour valider les
+    # requires_terms des métriques. Renseigné par KGResolver.resolve().
+    # Préfixé `_` parce que c'est interne au resolver, pas un champ
+    # public destiné aux consommateurs aval.
+    _extracted_terms_set: set[str] = field(default_factory=set)
 
     def is_empty(self) -> bool:
         return (
@@ -164,6 +197,7 @@ class KGResolver:
                           run_query(cypher, params).
         """
         self._driver = neo4j_driver
+        self._time_parser = TimeParser()
         logger.info("KGResolver initialisé")
 
     def resolve(self, enriched: EnrichedTerms) -> ResolvedContext:
@@ -181,6 +215,23 @@ class KGResolver:
         if enriched.is_empty() and not enriched.unresolved_terms:
             ctx.log("Aucun terme à résoudre")
             return ctx
+
+        # Set des termes extraits (lowercase), utilisé pour valider les
+        # `requires_terms` des métriques. Inclut le texte des termes
+        # classifiés, leur texte original si présent, et les unresolved
+        # bruts. Permet à correlation_prix_sentiment de ne s'activer que
+        # si la question parle effectivement de sentiment/news/...
+        extracted_terms_set: set[str] = set()
+        for term in enriched.terms:
+            if term.text:
+                extracted_terms_set.add(term.text.lower())
+            orig = getattr(term, "original_text", None)
+            if orig:
+                extracted_terms_set.add(orig.lower())
+        for raw in enriched.unresolved_terms:
+            if raw:
+                extracted_terms_set.add(raw.lower())
+        ctx._extracted_terms_set = extracted_terms_set
 
         # 1. Résolution des termes classifiés
         for term in enriched.terms:
@@ -356,6 +407,11 @@ class KGResolver:
     ) -> None:
         """
         Résout une métrique vers sa formule SQL et sa table source.
+
+        Filtre par `requires_terms` : si la métrique exige des termes
+        co-extraits (ex: correlation_prix_sentiment exige sentiment/news/
+        media/tone/gdelt), on ne l'active que si au moins un de ces termes
+        est dans les termes extraits de la question.
         """
         rows = self._driver.run_query(
             """
@@ -365,7 +421,8 @@ class KGResolver:
                    m.formula AS formula,
                    t.name AS source_table,
                    m.description AS description,
-                   m.domain AS domain
+                   m.domain AS domain,
+                   m.requires_terms AS requires_terms
             LIMIT 1
             """,
             {"text": text},
@@ -373,6 +430,20 @@ class KGResolver:
 
         if rows:
             row = rows[0]
+            extracted_set = getattr(ctx, "_extracted_terms_set", set())
+            if not _metric_prerequisites_met(
+                row.get("requires_terms"), extracted_set
+            ):
+                ctx.log(
+                    f"Metric '{row['name']}' ignorée pour le terme '{text}' : "
+                    f"prérequis non satisfaits "
+                    f"(requires={row.get('requires_terms')}, "
+                    f"extracted={sorted(extracted_set)})."
+                )
+                # Fallback vers la résolution comme BusinessTerm.
+                self._try_business_term_as_metric(text, ctx, term)
+                return
+
             ctx.metrics.append(
                 ResolvedMetric(
                     name=row["name"],
@@ -430,7 +501,10 @@ class KGResolver:
             )
             return
 
-        resolved = self._fuzzy_metric_match(text)
+        extracted_set = getattr(ctx, "_extracted_terms_set", set())
+        resolved = self._fuzzy_metric_match(
+            text, extracted_terms_set=extracted_set
+        )
         if resolved:
             ctx.metrics.append(resolved)
             ctx.tables_involved.add(resolved.source_table)
@@ -442,8 +516,28 @@ class KGResolver:
         self._classify_unresolved(text, term, ctx)
         ctx.log(f"Metric '{text}' — non trouvée dans le KG")
 
-    def _fuzzy_metric_match(self, text: str) -> ResolvedMetric | None:
-        """Fuzzy match contre toutes les métriques du KG."""
+    def _fuzzy_metric_match(
+        self,
+        text: str,
+        extracted_terms_set: set[str] | None = None,
+    ) -> ResolvedMetric | None:
+        """
+        Fuzzy match contre toutes les métriques du KG.
+
+        Le match par inclusion dans la description a été SUPPRIMÉ : il
+        était trop greedy et causait un faux match systématique de
+        correlation_prix_sentiment dès que la question contenait le mot
+        "corrélation" (présent dans la description). Seul le match par
+        nom de métrique reste.
+
+        Filtre aussi par `requires_terms` : une métrique avec prérequis
+        non satisfaits n'est même pas considérée comme candidate.
+
+        Args:
+            text: Terme à matcher.
+            extracted_terms_set: Set des termes extraits, pour filtrer les
+                                 métriques par requires_terms.
+        """
         rows = self._driver.run_query(
             """
             MATCH (m:Metric)-[:COMPUTED_FROM]->(t:Table)
@@ -451,24 +545,28 @@ class KGResolver:
                    m.formula AS formula,
                    t.name AS source_table,
                    m.description AS description,
-                   m.domain AS domain
+                   m.domain AS domain,
+                   m.requires_terms AS requires_terms
             """
         )
 
         text_lower = text.lower()
         best_score = 0.0
         best_row = None
+        extracted = extracted_terms_set or set()
 
         for row in rows:
+            # Filtrer par requires_terms : une métrique avec prérequis
+            # non satisfaits ne participe pas au scoring.
+            if not _metric_prerequisites_met(
+                row.get("requires_terms"), extracted
+            ):
+                continue
+
             name_lower = (row.get("name") or "").lower()
             score = SequenceMatcher(None, text_lower, name_lower).ratio()
             if score > best_score and score >= FUZZY_THRESHOLD:
                 best_score = score
-                best_row = row
-
-            desc_lower = (row.get("description") or "").lower()
-            if text_lower and text_lower in desc_lower and 0.85 > best_score:
-                best_score = 0.85
                 best_row = row
 
         if not best_row:
@@ -605,19 +703,41 @@ class KGResolver:
 
     # ─── TimePeriod resolution ────────────────────────────────
 
-    def _resolve_time_period(self, text: str, ctx: ResolvedContext) -> None:
+    def _resolve_time_period(self, text, ctx):
         """
-        Résout une période temporelle vers son filtre SQL.
-        Si elle n'est pas canonique, on la conserve telle quelle
-        comme période non normalisée pour traitement ultérieur.
+        Résout une expression temporelle en filtre SQL.
+
+        Flow :
+        1. TimeParser Python (mécanisme principal)
+        2. KG lookup (fallback pour alias métier spéciaux)
         """
+        # 1. TimeParser
+        parsed = self._time_parser.parse(text)
+
+        if parsed is not None:
+            ctx.time_periods.append(
+                ResolvedTimePeriod(
+                    name=text,
+                    sql_expression=parsed.filter_clause,
+                    filter_expression=parsed.filter_clause,
+                    is_resolved=True,
+                )
+            )
+            ctx.log(
+                f"TimePeriod '{text}' → {parsed.filter_clause} "
+                f"[{parsed.granularity}, "
+                f"{'past' if parsed.is_past else 'future' if parsed.is_future else 'current'}]"
+            )
+            return
+
+        # 2. KG fallback
         rows = self._driver.run_query(
             """
             MATCH (tp:TimePeriod)
             WHERE toLower(tp.name) = toLower($text)
             RETURN tp.name AS name,
-                   tp.sql_expression AS sql_expression,
-                   tp.filter_expression AS filter_expression
+                tp.sql_expression AS sql_expression,
+                tp.filter_expression AS filter_expression
             LIMIT 1
             """,
             {"text": text},
@@ -630,61 +750,22 @@ class KGResolver:
                     name=row["name"],
                     sql_expression=row["sql_expression"],
                     filter_expression=row["filter_expression"],
-                    is_canonical=True,
+                    is_resolved=True,
                 )
             )
-            ctx.log(f"TimePeriod '{text}' → {row['filter_expression']}")
+            ctx.log(f"TimePeriod '{text}' (KG) → {row['filter_expression']}")
             return
 
-        resolved = self._fuzzy_time_period_match(text)
-        if resolved:
-            ctx.time_periods.append(resolved)
-            ctx.log(f"TimePeriod '{text}' (fuzzy) → {resolved.filter_expression}")
-            return
-
+        # 3. Non résolu
         ctx.time_periods.append(
             ResolvedTimePeriod(
                 name=text,
                 sql_expression="",
                 filter_expression="",
-                is_canonical=False,
+                is_resolved=False,
             )
         )
-        ctx.log(
-            f"TimePeriod '{text}' — non canonique, conservée pour traitement ultérieur"
-        )
-
-    def _fuzzy_time_period_match(self, text: str) -> ResolvedTimePeriod | None:
-        """Fuzzy match contre toutes les périodes du KG."""
-        rows = self._driver.run_query(
-            """
-            MATCH (tp:TimePeriod)
-            RETURN tp.name AS name,
-                   tp.sql_expression AS sql_expression,
-                   tp.filter_expression AS filter_expression
-            """
-        )
-
-        text_lower = text.lower()
-        best_score = 0.0
-        best_row = None
-
-        for row in rows:
-            name_lower = (row.get("name") or "").lower()
-            score = SequenceMatcher(None, text_lower, name_lower).ratio()
-            if score > best_score and score >= FUZZY_THRESHOLD:
-                best_score = score
-                best_row = row
-
-        if not best_row:
-            return None
-
-        return ResolvedTimePeriod(
-            name=best_row["name"],
-            sql_expression=best_row["sql_expression"],
-            filter_expression=best_row["filter_expression"],
-            is_canonical=True,
-        )
+        ctx.log(f"TimePeriod '{text}' — non résolu")
 
     # ─── Unresolved terms — dernière chance ───────────────────
 
@@ -767,7 +848,8 @@ class KGResolver:
             RETURN m.name AS name,
                    m.formula AS formula,
                    t.name AS source_table,
-                   m.description AS description
+                   m.description AS description,
+                   m.requires_terms AS requires_terms
             LIMIT 1
             """,
             {"text": text},
@@ -775,17 +857,28 @@ class KGResolver:
 
         if rows:
             row = rows[0]
-            ctx.metrics.append(
-                ResolvedMetric(
-                    name=row["name"],
-                    formula=row["formula"],
-                    source_table=row["source_table"],
-                    description=row.get("description", ""),
+            # Même filtre requires_terms ici : un terme unresolved ne doit
+            # pas non plus contourner les contraintes d'activation.
+            extracted_set = getattr(ctx, "_extracted_terms_set", set())
+            if _metric_prerequisites_met(
+                row.get("requires_terms"), extracted_set
+            ):
+                ctx.metrics.append(
+                    ResolvedMetric(
+                        name=row["name"],
+                        formula=row["formula"],
+                        source_table=row["source_table"],
+                        description=row.get("description", ""),
+                    )
                 )
-            )
-            ctx.tables_involved.add(row["source_table"])
-            ctx.log(f"Unresolved '{text}' → résolu comme Metric: {row['name']}")
-            return
+                ctx.tables_involved.add(row["source_table"])
+                ctx.log(f"Unresolved '{text}' → résolu comme Metric: {row['name']}")
+                return
+            else:
+                ctx.log(
+                    f"Unresolved '{text}' aurait matché Metric '{row['name']}' "
+                    f"mais requires_terms={row.get('requires_terms')} non satisfait."
+                )
 
         matching_term = self._find_matching_classified_term(text, enriched)
         self._classify_unresolved(text, matching_term, ctx)

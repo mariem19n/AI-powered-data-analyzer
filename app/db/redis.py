@@ -208,7 +208,11 @@ class RedisClient:
     # ==========================================================
 
     async def set_response_cache(
-        self, question: str, response: dict, is_historical: bool = False
+        self,
+        question: str,
+        response: dict,
+        is_historical: bool | int = False,
+        ttl_s: int | None = None,
     ) -> None:
         """
         Stocke la réponse complète (texte + graphiques + insights).
@@ -219,12 +223,24 @@ class RedisClient:
             is_historical: True = TTL 24h, False = TTL 1h.
         """
         key = self._build_cache_key(self.PREFIX_RESPONSE, question)
-        ttl = settings.cache_ttl_historical if is_historical else settings.cache_ttl_transactional
+        if ttl_s is not None:
+            ttl = ttl_s
+            historical = False
+        elif type(is_historical) is int:
+            ttl = is_historical
+            historical = False
+        else:
+            historical = bool(is_historical)
+            ttl = (
+                settings.cache_ttl_historical
+                if historical
+                else settings.cache_ttl_transactional
+            )
         payload = self._serialize({
             "response": response,
             "original_question": question,
             "cached_at": time.time(),
-            "is_historical": is_historical,
+            "is_historical": historical,
         })
         await self._client.setex(key, ttl, payload)
         await self._increment_stat("cache:response:writes")

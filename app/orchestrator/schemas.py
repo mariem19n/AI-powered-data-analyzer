@@ -29,6 +29,7 @@ class IntentType(str, Enum):
     ANOMALY_DETECTION = "anomaly_detection"
     FORECASTING = "forecasting"
     DIAGNOSIS = "diagnosis"
+    EXTERNAL_KNOWLEDGE = "external_knowledge" 
     UNKNOWN = "unknown"  # fallback si le LLM ne sait pas classifier
 
 
@@ -266,6 +267,14 @@ class OrchestratorResponse(BaseModel):
         description="True si certaines étapes ont échoué mais d'autres ont réussi",
     )
     failed_steps: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Warnings non-bloquants produits pendant l'exécution. "
+            "Inclut : viz manquante, conversion datetime ratée, KG indisponible, "
+            "supporting_stats invalides, fallback LLM utilisé, etc."
+        ),
+    )
 
     # Traçabilité des sources — L'UTILISATEUR DOIT TOUJOURS SAVOIR
     response_mode: ResponseMode = Field(
@@ -295,4 +304,8 @@ class OrchestratorResponse(BaseModel):
     cache_hit: bool = False
     total_duration_s: float = 0.0
     llm_calls: int = 0
+    llm_trace: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Trace des appels LLM effectues pendant cette requete",
+    )
     created_at: datetime = Field(default_factory=datetime.utcnow)

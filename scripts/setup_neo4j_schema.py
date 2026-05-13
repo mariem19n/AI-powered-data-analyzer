@@ -216,20 +216,30 @@ def create_business_terms(session):
 # ─── SP1-51 : Métriques ───────────────────────────────────────
 
 def create_metrics(session):
+    """
+    Crée les Metric avec leur formule, leur table source et leurs
+    `requires_terms` (sémantique OR : la métrique s'active si au moins un
+    de ces termes est extrait de la question).
+    """
     print("\n📊 Métriques calculées (SP1-51)...")
-    for name, domain, description, formula, table in METRICS:
+    for name, domain, description, formula, table, requires_terms in METRICS:
         session.run("""
             MERGE (m:Metric {name: $name})
-            SET m.domain      = $domain,
-                m.description = $description,
-                m.formula     = $formula,
-                m.updated_at  = datetime()
+            SET m.domain         = $domain,
+                m.description    = $description,
+                m.formula        = $formula,
+                m.requires_terms = $requires_terms,
+                m.updated_at     = datetime()
             WITH m
             MATCH (t:Table {name: $table})
             MERGE (m)-[:COMPUTED_FROM]->(t)
         """, name=name, domain=domain, description=description,
-             formula=formula, table=table)
-        print(f"  ✅ {name} ({domain})")
+             formula=formula, table=table,
+             requires_terms=requires_terms or [])
+        req_label = (
+            f" [requires={requires_terms}]" if requires_terms else ""
+        )
+        print(f"  ✅ {name} ({domain}){req_label}")
 
 
 # ─── SP1-51 : Règles métier ───────────────────────────────────
@@ -298,6 +308,19 @@ def verify(session):
     ).single()["c"]
     print(f"  BusinessTerm→Column : {bt_rels}/{len(BUSINESS_TERMS)}")
 
+    # Affichage des métriques avec requires_terms (pour vérifier la contrainte
+    # d'activation correlation_prix_sentiment).
+    constrained_metrics = session.run("""
+        MATCH (m:Metric)
+        WHERE m.requires_terms IS NOT NULL AND size(m.requires_terms) > 0
+        RETURN m.name AS name, m.requires_terms AS requires
+        ORDER BY m.name
+    """).data()
+    if constrained_metrics:
+        print(f"\n  Métriques avec requires_terms :")
+        for r in constrained_metrics:
+            print(f"    • {r['name']} ← {r['requires']}")
+
 
 # ─── Main ─────────────────────────────────────────────────────
 
@@ -338,7 +361,6 @@ def main():
 
     print(f"\n{'═'*65}")
     print("  ✅ SP1-45 + SP1-51 TERMINÉS")
-    print("  Prochaine étape : SP1-46 — Semantic Layer (Business Terms Extraction)")
     print(f"{'═'*65}")
 
 

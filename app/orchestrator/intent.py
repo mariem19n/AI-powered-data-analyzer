@@ -31,7 +31,7 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.55
 
 INTENT_SYSTEM_PROMPT = """Tu es un classifieur d'intent pour un système d'analyse de données crypto et macroéconomique.
 
-Tu reçois une question en langage naturel et tu retournes son intent parmi ces 6 catégories :
+Tu reçois une question en langage naturel et tu retournes son intent parmi ces 7 catégories :
 
 1. **aggregation** — Demande une valeur ou un ensemble de valeurs direct.
    Exemples : "montre le prix du Bitcoin ce mois", "volume de SOL hier", "liste des cryptos"
@@ -51,6 +51,20 @@ Tu reçois une question en langage naturel et tu retournes son intent parmi ces 
 6. **diagnosis** — Cherche les causes d'un phénomène observé. Souvent composite
    (implique anomaly + correlation).
    Exemples : "pourquoi BTC a chuté la semaine dernière", "qu'est-ce qui a causé le crash de mai"
+
+7. **external_knowledge** — Demande de définition, explication ou contexte sur un
+   concept, indicateur ou actualité qui n'est pas dans la base de données interne.
+   La réponse viendra d'une recherche web (Tavily) suivie d'un résumé synthétique.
+   Exemples :
+     - "explique le fear and greed index"
+     - "qu'est-ce que le halving Bitcoin"
+     - "définition du funding rate"
+     - "actualités sur la régulation crypto en Europe"
+     - "qui est Vitalik Buterin"
+   À ne PAS confondre avec aggregation : si la question demande une VALEUR concrète
+   sur les données internes (prix, volume, ratio), c'est aggregation. Si la question
+   demande de COMPRENDRE un concept ou de RAFRAÎCHIR avec des actualités web, c'est
+   external_knowledge.
 
 Règles de classification :
 

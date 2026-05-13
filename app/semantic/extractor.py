@@ -19,8 +19,7 @@ import logging
 import os
 from typing import Any
 
-from openai import OpenAI
-
+from app.llm import LLMClient
 from app.semantic.preprocessor import Preprocessor
 from app.semantic.prompts import (
     KGVocabulary,
@@ -55,8 +54,8 @@ class BusinessTermsExtractor:
         if not api_key:
             raise ValueError("OPENAI_API_KEY manquant dans .env")
 
-        self._client = OpenAI(api_key=api_key)
         self._model = os.getenv("SEMANTIC_LLM_MODEL", DEFAULT_MODEL)
+        self._client = LLMClient(model=self._model, api_key=api_key)
 
         self._vocab = KGVocabulary()
         self._prompt = ""
@@ -210,20 +209,18 @@ class BusinessTermsExtractor:
                 logger.error("Prompt vide — vocabulaire KG non chargé.")
                 return None
 
-            response = self._client.chat.completions.create(
-                model=self._model,
-                max_tokens=512,
+            raw = self._client.chat(
+                system=system,
+                user=EXTRACTION_USER_TEMPLATE.format(question=question),
+                purpose=(
+                    "semantic_term_extraction_retry"
+                    if is_retry
+                    else "semantic_term_extraction"
+                ),
                 temperature=0.0,
-                messages=[
-                    {"role": "system", "content": system},
-                    {
-                        "role": "user",
-                        "content": EXTRACTION_USER_TEMPLATE.format(question=question),
-                    },
-                ],
+                max_tokens=512,
             )
-
-            raw = (response.choices[0].message.content or "").strip()
+            raw = raw.strip()
             logger.debug("Réponse LLM : %s", raw[:500])
 
             parsed = self._parse_json(raw)

@@ -137,6 +137,10 @@ class TavilyExternalTool:
             "coinglass.com",
             "santiment.net",
             "lunarcrush.com",
+            "coinmarketcap.com",
+            "coingecko.com",
+            "coindesk.com",
+            "cointelegraph.com",
         ],
         "crypto_news": [
             "coindesk.com",

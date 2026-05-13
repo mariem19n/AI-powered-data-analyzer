@@ -37,7 +37,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 30s
     networks:
       - analyzer-net
     restart: unless-stopped
@@ -85,11 +85,20 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
+    # ───────────────────────────────────────────────────────────
+    # Healthcheck via cypher-shell : teste Bolt + auth + base
+    # vraiment prête à exécuter une requête. C'est le SEUL test
+    # fiable — un check HTTP sur 7474 répond AVANT que Bolt soit
+    # accepté, ce qui produit un faux positif et fait crasher
+    # l'API au démarrage.
+    # ───────────────────────────────────────────────────────────
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      test:
+        - "CMD-SHELL"
+        - "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-neo4j_secret} 'RETURN 1' || exit 1"
       interval: 10s
-      timeout: 5s
-      retries: 10
+      timeout: 10s
+      retries: 20
       start_period: 60s
     networks:
       - analyzer-net

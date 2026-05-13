@@ -10,7 +10,8 @@ SemanticContext (adaptation fine selon entités, tables, métriques).
 Exemples :
   - aggregation simple → 1 SQL Agent
   - comparison 2 entités → 2 SQL Agents + 1 Analyse
-  - correlation 2 tables → 2 SQL Agents + resampling + correlation
+  - correlation 2 entités même table → N SQL Agents (1 par entité) + 1 Analyse
+  - correlation cross-table → N SQL Agents (1 par table) + 1 Analyse
   - diagnosis avec sentiment → SQL + anomalies + SQL contexte + corrélation sentiment
 
 Signature composite :
@@ -36,6 +37,192 @@ from app.orchestrator.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Colonnes par défaut à analyser pour anomaly_detection quand l'utilisateur
+# n'a précisé aucune métrique explicite (voir _enrich_context_for_anomaly).
+DEFAULT_ANOMALY_COLUMNS_BY_ENTITY: dict[str, list[dict[str, str]]] = {
+    "crypto": [
+        {
+            "name": "prix",
+            "table": "fact_crypto_daily",
+            "column": "close_usd",
+            "description": "Prix de clôture par défaut pour analyse d'anomalies",
+        },
+        {
+            "name": "volume",
+            "table": "fact_crypto_daily",
+            "column": "volume",
+            "description": "Volume par défaut pour analyse d'anomalies",
+        },
+    ],
+}
+
+
+# Colonnes par défaut à extraire pour correlation quand l'utilisateur
+# n'a précisé aucune métrique. Une corrélation cross-entity nécessite
+# une série numérique par entité — on prend le close_usd par défaut
+# pour les cryptos.
+DEFAULT_CORRELATION_COLUMNS_BY_ENTITY: dict[str, list[dict[str, str]]] = {
+    "crypto": [
+        {
+            "name": "prix",
+            "table": "fact_crypto_daily",
+            "column": "close_usd",
+            "description": "Prix de clôture par défaut pour analyse de corrélation",
+        },
+    ],
+    "macro_indicator": [
+        {
+            "name": "valeur",
+            "table": "fact_fred_observation",
+            "column": "value",
+            "description": "Valeur de l'indicateur macro pour analyse de corrélation",
+        },
+    ],
+}
+
+
+def _enrich_context_for_anomaly(ctx: dict) -> dict:
+    """
+    Retourne une COPIE enrichie du SemanticContext pour anomaly_detection.
+
+    Règles :
+      1. Si ctx.columns déjà non-vide → on respecte le choix utilisateur
+      2. Sinon, si entité crypto → ajoute close_usd + volume
+      3. Les colonnes sont aussi propagées dans tables[0].columns_used
+    """
+    import copy as _copy
+
+    existing_columns = ctx.get("columns") or []
+    if existing_columns:
+        return ctx
+
+    entity_filters = ctx.get("entity_filters") or []
+    entity_types = {
+        ef.get("entity_type")
+        for ef in entity_filters
+        if isinstance(ef, dict) and ef.get("entity_type")
+    }
+
+    default_cols = None
+    for et in entity_types:
+        if et in DEFAULT_ANOMALY_COLUMNS_BY_ENTITY:
+            default_cols = DEFAULT_ANOMALY_COLUMNS_BY_ENTITY[et]
+            break
+
+    if not default_cols:
+        return ctx
+
+    enriched_ctx = _copy.deepcopy(ctx)
+    enriched_ctx["columns"] = list(default_cols)
+
+    tables = enriched_ctx.get("tables") or []
+    if tables and isinstance(tables[0], dict):
+        primary_table = tables[0]
+        if primary_table.get("table_name") == "fact_crypto_daily":
+            existing_cols_used = primary_table.get("columns_used") or []
+            new_cols = [c["column"] for c in default_cols]
+            merged = list(existing_cols_used)
+            for col in new_cols:
+                if col not in merged:
+                    merged.append(col)
+            primary_table["columns_used"] = merged
+
+    return enriched_ctx
+
+
+def _enrich_context_for_correlation(ctx: dict, entity_filter: dict) -> dict:
+    """
+    Retourne une COPIE enrichie du SemanticContext pour un step SQL
+    de corrélation, scopée sur UNE seule entité.
+
+    Une corrélation cross-entity demande une série numérique par entité.
+    Comme l'utilisateur n'a précisé aucune métrique (cf. requires_terms),
+    on injecte ici la colonne adéquate selon le type d'entité.
+
+    Règles :
+      1. Filtres : on remplace entity_filters par UNIQUEMENT cette entité,
+         pour que le SQL Agent ne fasse pas `WHERE symbol='BTC' AND symbol='ETH'`.
+      2. Colonnes : si ctx.columns vide, on injecte close_usd (crypto) ou
+         value (macro) selon le type de l'entité.
+      3. tables[0].columns_used : propagation des colonnes pour que le
+         SELECT inclue date + colonne-valeur.
+
+    Args:
+        ctx : SemanticContext brut
+        entity_filter : un seul élément de ctx.entity_filters
+
+    Returns:
+        SemanticContext deep-copié, scopé sur cette entité, prêt pour SQL.
+    """
+    import copy as _copy
+
+    enriched_ctx = _copy.deepcopy(ctx)
+
+    # 1. Filtres : restreindre à cette entité uniquement.
+    enriched_ctx["entity_filters"] = [_copy.deepcopy(entity_filter)]
+
+    # 2. Détecter le type d'entité pour choisir la colonne par défaut.
+    entity_type = entity_filter.get("entity_type") or ""
+    default_cols = DEFAULT_CORRELATION_COLUMNS_BY_ENTITY.get(entity_type)
+
+    existing_columns = enriched_ctx.get("columns") or []
+
+    # Si pas de métrique ni colonne déjà choisie, on injecte les défauts.
+    if not existing_columns and default_cols:
+        enriched_ctx["columns"] = list(default_cols)
+
+    # 3. Propager dans tables[0].columns_used.
+    tables = enriched_ctx.get("tables") or []
+    target_table = entity_filter.get("table")
+    if tables and target_table:
+        for tbl in tables:
+            if isinstance(tbl, dict) and tbl.get("table_name") == target_table:
+                existing_cols_used = tbl.get("columns_used") or []
+                new_cols: list[str] = []
+                # Toujours utile : la date
+                new_cols.append("date")
+                # Puis les colonnes-valeurs si on en a injecté
+                if not existing_columns and default_cols:
+                    for c in default_cols:
+                        new_cols.append(c["column"])
+                merged = list(existing_cols_used)
+                for col in new_cols:
+                    if col not in merged:
+                        merged.append(col)
+                tbl["columns_used"] = merged
+                break
+
+    # 4. Sécuriser les filtres au niveau tables[0].filters : retirer les
+    #    filtres "symbol = 'X'" qui ne concernent PAS l'entité courante.
+    #    Le SQL Agent les recompose à partir d'entity_filters ; les filtres
+    #    legacy au niveau table créent le WHERE multi-symbol absurde.
+    if tables:
+        for tbl in tables:
+            if not isinstance(tbl, dict):
+                continue
+            filters = tbl.get("filters") or []
+            entity_value = str(entity_filter.get("value", "")).strip()
+            entity_column = str(entity_filter.get("column", "")).strip()
+            cleaned: list[str] = []
+            for f in filters:
+                if not isinstance(f, str):
+                    cleaned.append(f)
+                    continue
+                # Heuristique : si le filtre contient la colonne de l'entité
+                # ET qu'il NE correspond PAS à la valeur courante, on l'écarte.
+                if (
+                    entity_column
+                    and entity_column in f
+                    and entity_value not in f
+                ):
+                    continue
+                cleaned.append(f)
+            tbl["filters"] = cleaned
+
+    return enriched_ctx
+
 
 
 # ─── Signature composite ──────────────────────────────────────
@@ -91,6 +278,7 @@ class PlanGenerator:
         self,
         intent: Intent,
         semantic_context: dict[str, Any],
+        external_result: dict[str, Any] | None = None,
     ) -> ExecutionPlan:
         """
         Génère le plan adapté.
@@ -98,6 +286,10 @@ class PlanGenerator:
         Args:
             intent : résultat de la détection d'intent
             semantic_context : SemanticContext sérialisé
+            external_result : résultat Tavily si déjà obtenu en amont
+                (ExternalResult.to_dict()). Permet de construire des plans
+                external_summary (mode external) ou hybrid_summary
+                (intent analytique avec analytic_gaps comblés par Tavily).
 
         Returns:
             ExecutionPlan prêt à être exécuté
@@ -105,8 +297,10 @@ class PlanGenerator:
         signature = compute_plan_signature(intent, semantic_context)
 
         # Dispatch sur l'intent principal
-        if intent.primary == IntentType.AGGREGATION:
-            steps = self._aggregation_steps(semantic_context)
+        if intent.primary == IntentType.EXTERNAL_KNOWLEDGE:
+            steps = self._external_knowledge_steps(semantic_context, external_result)
+        elif intent.primary == IntentType.AGGREGATION:
+            steps = self._aggregation_steps(semantic_context, external_result)
         elif intent.primary == IntentType.COMPARISON:
             steps = self._comparison_steps(semantic_context)
         elif intent.primary == IntentType.CORRELATION:
@@ -135,21 +329,124 @@ class PlanGenerator:
         )
         return plan
 
-    # ─── AGGREGATION ──────────────────────────────────────────
+    # ─── Helper Tavily ────────────────────────────────────────
 
     @staticmethod
-    def _aggregation_steps(ctx: dict[str, Any]) -> list[ExecutionStep]:
+    def _build_tavily_payload_for_analysis(
+        external_result: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """
+        Extrait du résultat Tavily UNIQUEMENT les champs utiles aux tasks
+        external_summary / hybrid_summary :
+          - sources (title, url, snippet, score)
+          - extracted_content
+          - query
+
+        On EXCLUT volontairement `answer` Tavily : on veut que le LLM
+        analyse synthétise lui-même à partir du contenu brut + sources,
+        plutôt que de régurgiter la réponse pré-mâchée de Tavily.
+        """
+        if not isinstance(external_result, dict):
+            return None
+        if not external_result.get("sources") and not external_result.get(
+            "extracted_content"
+        ):
+            return None
+        return {
+            "query": external_result.get("query", ""),
+            "source": external_result.get("source", "tavily"),
+            "provider": external_result.get("provider", "tavily"),
+            "sources": list(external_result.get("sources", [])),
+            "extracted_content": external_result.get("extracted_content", ""),
+        }
+
+    # ─── EXTERNAL_KNOWLEDGE ───────────────────────────────────
+
+    @classmethod
+    def _external_knowledge_steps(
+        cls,
+        ctx: dict[str, Any],
+        external_result: dict[str, Any] | None = None,
+    ) -> list[ExecutionStep]:
+        """
+        Plan mono-step pour les questions de type EXTERNAL_KNOWLEDGE.
+
+        Pas de SQL : Tavily est déjà passé par l'Orchestrator, son résultat
+        est injecté DIRECTEMENT dans l'instruction du step Analysis.
+        """
+        tavily_payload = cls._build_tavily_payload_for_analysis(external_result)
         return [
             ExecutionStep(
-                step_id="sql_1",
-                agent=AgentType.SQL_AGENT,
-                description="Extraire les données demandées",
+                step_id="analyse_1",
+                agent=AgentType.ANALYSIS_AGENT,
+                description="Résumé pédagogique à partir des sources externes",
                 instruction={
-                    "task": "extract",
+                    "task": "external_summary",
+                    "tavily_payload": tavily_payload,
                     "semantic_context": ctx,
                 },
+                depends_on=[],
+                parallelizable=False,
             ),
         ]
+
+    # ─── AGGREGATION ──────────────────────────────────────────
+
+    @classmethod
+    def _aggregation_steps(
+        cls,
+        ctx: dict[str, Any],
+        external_result: dict[str, Any] | None = None,
+    ) -> list[ExecutionStep]:
+        """
+        Pour une agrégation : SQL + Analyse.
+
+        Mode HYBRID : si le SemanticContext contient des `analytic_gaps`
+        ET qu'un external_result Tavily est disponible, l'Analyse devient
+        task='hybrid_summary' qui synthétise SQL + Tavily ensemble.
+        """
+        analytic_gaps = ctx.get("analytic_gaps") or []
+        is_hybrid = bool(analytic_gaps) and external_result is not None
+
+        sql_step = ExecutionStep(
+            step_id="sql_1",
+            agent=AgentType.SQL_AGENT,
+            description="Extraire les données demandées",
+            instruction={
+                "task": "extract",
+                "semantic_context": ctx,
+            },
+        )
+
+        if is_hybrid:
+            tavily_payload = cls._build_tavily_payload_for_analysis(external_result)
+            analysis_step = ExecutionStep(
+                step_id="analyse_1",
+                agent=AgentType.ANALYSIS_AGENT,
+                description="Synthèse hybride : données internes + sources externes",
+                instruction={
+                    "task": "hybrid_summary",
+                    "input_steps": ["sql_1"],
+                    "semantic_context": ctx,
+                    "tavily_payload": tavily_payload,
+                    "analytic_gaps": list(analytic_gaps),
+                },
+                depends_on=["sql_1"],
+            )
+        else:
+            analysis_step = ExecutionStep(
+                step_id="analyse_1",
+                agent=AgentType.ANALYSIS_AGENT,
+                description="Résumé descriptif et insights",
+                instruction={
+                    "task": "descriptive",
+                    "input_steps": ["sql_1"],
+                    "semantic_context": ctx,
+                },
+                depends_on=["sql_1"],
+            )
+
+        return [sql_step, analysis_step]
 
     # ─── COMPARISON ───────────────────────────────────────────
 
@@ -225,16 +522,83 @@ class PlanGenerator:
 
     @staticmethod
     def _correlation_steps(ctx: dict[str, Any]) -> list[ExecutionStep]:
-        tables = {t["table_name"] for t in ctx.get("tables", [])}
-        cross_table = len(tables) >= 2
+        """
+        Plan pour correlation.
 
+        Stratégie : émettre UN step SQL par série à corréler, suivi d'UN
+        step Analysis qui consomme tous les steps SQL en `input_steps`.
+
+        Trois sous-cas :
+          1. ≥ 2 entités, même table (ex: BTC vs ETH) :
+             → 1 step SQL par entité, chacun scopé sur cette entité
+               (entity_filter_override + columns_used forcés à date+close_usd).
+             → 1 step Analysis avec input_steps = [sql_1, sql_2, ...].
+
+          2. ≥ 2 tables (cross-table, ex: BTC vs taux Fed) :
+             → 1 step SQL par table, chacun avec table_subset adapté.
+             → 1 step Analysis cross_table=True, input_steps = [sql_1, sql_2].
+
+          3. Cas dégénéré (< 2 entités et < 2 tables) :
+             → fallback : 1 step SQL + 1 step Analysis, l'Analysis lèvera
+               un warning "moins de 2 séries — corrélation impossible".
+
+        Important : pour le cas 1, on s'inspire du pattern de
+        _comparison_steps qui marche déjà. Le SemanticContext est
+        deep-copié et scopé via _enrich_context_for_correlation pour
+        éviter le WHERE multi-symbol absurde et garantir que close_usd
+        est bien extrait même si l'utilisateur n'a précisé aucune
+        métrique (cas typique "corrélation entre BTC et ETH").
+        """
+        entities = ctx.get("entity_filters") or []
+        tables_in_ctx = {
+            t.get("table_name")
+            for t in ctx.get("tables", [])
+            if isinstance(t, dict) and t.get("table_name")
+        }
+        cross_table = len(tables_in_ctx) >= 2
+
+        # ── Cas 1 : ≥ 2 entités sur la même table ─────────────
+        if not cross_table and len(entities) >= 2:
+            steps: list[ExecutionStep] = []
+            for i, entity in enumerate(entities, start=1):
+                scoped_ctx = _enrich_context_for_correlation(ctx, entity)
+                entity_label = entity.get("entity_name") or entity.get("value") or f"série {i}"
+                steps.append(
+                    ExecutionStep(
+                        step_id=f"sql_{i}",
+                        agent=AgentType.SQL_AGENT,
+                        description=f"Extraire série temporelle pour {entity_label}",
+                        instruction={
+                            "task": "extract",
+                            "semantic_context": scoped_ctx,
+                            "entity_filter_override": entity,
+                        },
+                        parallelizable=True,
+                    )
+                )
+            input_step_ids = [s.step_id for s in steps]
+            steps.append(
+                ExecutionStep(
+                    step_id="analyse_1",
+                    agent=AgentType.ANALYSIS_AGENT,
+                    description="Corrélation entre N séries (même table)",
+                    instruction={
+                        "task": "correlation",
+                        "cross_table": False,
+                        "input_steps": input_step_ids,
+                    },
+                    depends_on=list(input_step_ids),
+                )
+            )
+            return steps
+
+        # ── Cas 2 : cross-table (≥ 2 tables) ──────────────────
         if cross_table:
-            # Tables différentes : besoin d'alignement temporel avant corrélation
             steps = [
                 ExecutionStep(
                     step_id="sql_1",
                     agent=AgentType.SQL_AGENT,
-                    description="Extraire série A",
+                    description="Extraire série A (table primaire)",
                     instruction={
                         "task": "extract",
                         "semantic_context": ctx,
@@ -245,7 +609,7 @@ class PlanGenerator:
                 ExecutionStep(
                     step_id="sql_2",
                     agent=AgentType.SQL_AGENT,
-                    description="Extraire série B",
+                    description="Extraire série B (table secondaire / filter)",
                     instruction={
                         "task": "extract",
                         "semantic_context": ctx,
@@ -256,7 +620,7 @@ class PlanGenerator:
                 ExecutionStep(
                     step_id="analyse_1",
                     agent=AgentType.ANALYSIS_AGENT,
-                    description="Alignement temporel + corrélation",
+                    description="Alignement temporel + corrélation cross-table",
                     instruction={
                         "task": "correlation",
                         "cross_table": True,
@@ -265,42 +629,22 @@ class PlanGenerator:
                     depends_on=["sql_1", "sql_2"],
                 ),
             ]
-        else:
-            # Même table : pivot + corrélation directe
-            steps = [
-                ExecutionStep(
-                    step_id="sql_1",
-                    agent=AgentType.SQL_AGENT,
-                    description="Extraire les séries (même table)",
-                    instruction={
-                        "task": "extract",
-                        "semantic_context": ctx,
-                        "pivot_on_entity": True,
-                    },
-                ),
-                ExecutionStep(
-                    step_id="analyse_1",
-                    agent=AgentType.ANALYSIS_AGENT,
-                    description="Corrélation",
-                    instruction={
-                        "task": "correlation",
-                        "cross_table": False,
-                        "input_steps": ["sql_1"],
-                    },
-                    depends_on=["sql_1"],
-                ),
-            ]
-        return steps
+            return steps
 
-    # ─── ANOMALY DETECTION ────────────────────────────────────
-
-    @staticmethod
-    def _anomaly_steps(ctx: dict[str, Any]) -> list[ExecutionStep]:
+        # ── Cas 3 : fallback (< 2 entités, < 2 tables) ────────
+        # La corrélation a besoin d'au moins 2 séries — la task lèvera un
+        # warning explicite ("Moins de 2 séries exploitables").
+        logger.warning(
+            "Plan correlation dégénéré : %d entités, %d tables. "
+            "La task correlation produira un warning.",
+            len(entities),
+            len(tables_in_ctx),
+        )
         return [
             ExecutionStep(
                 step_id="sql_1",
                 agent=AgentType.SQL_AGENT,
-                description="Extraire série temporelle",
+                description="Extraction best-effort (corrélation dégénérée)",
                 instruction={
                     "task": "extract",
                     "semantic_context": ctx,
@@ -309,10 +653,47 @@ class PlanGenerator:
             ExecutionStep(
                 step_id="analyse_1",
                 agent=AgentType.ANALYSIS_AGENT,
-                description="Détection d'anomalies (Z-score / IQR / Isolation Forest)",
+                description="Corrélation (sera dégénérée — moins de 2 séries)",
+                instruction={
+                    "task": "correlation",
+                    "cross_table": False,
+                    "input_steps": ["sql_1"],
+                },
+                depends_on=["sql_1"],
+            ),
+        ]
+
+    # ─── ANOMALY DETECTION ────────────────────────────────────
+
+    @staticmethod
+    def _anomaly_steps(ctx: dict[str, Any]) -> list[ExecutionStep]:
+        """
+        Plan pour anomaly_detection.
+
+        Si l'utilisateur n'a précisé aucune colonne et que l'entité est crypto,
+        on enrichit le SemanticContext envoyé au SQL Agent avec close_usd +
+        volume (voir _enrich_context_for_anomaly). Cela permet à
+        Isolation Forest de se déclencher côté Analysis Agent.
+        """
+        enriched_ctx = _enrich_context_for_anomaly(ctx)
+        return [
+            ExecutionStep(
+                step_id="sql_1",
+                agent=AgentType.SQL_AGENT,
+                description="Extraire série temporelle",
+                instruction={
+                    "task": "extract",
+                    "semantic_context": enriched_ctx,
+                },
+            ),
+            ExecutionStep(
+                step_id="analyse_1",
+                agent=AgentType.ANALYSIS_AGENT,
+                description="Détection d'anomalies (IQR / Z-score / Isolation Forest auto)",
                 instruction={
                     "task": "anomaly_detection",
                     "input_steps": ["sql_1"],
+                    "semantic_context": enriched_ctx,
                 },
                 depends_on=["sql_1"],
             ),

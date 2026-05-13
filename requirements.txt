@@ -26,6 +26,9 @@ passlib[bcrypt]==1.7.4
 httpx==0.27.2
 pydantic==2.9.2
 pydantic-settings==2.5.2
+pandas==2.2.3
+numpy==2.1.2
+plotly==5.24.1
 
 google-generativeai
 
@@ -34,3 +37,5 @@ openai
 langgraph>=0.2.0
 
 httpx 
+
+scikit-learn>=1.3

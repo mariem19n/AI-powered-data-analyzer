@@ -109,11 +109,12 @@ class ResponseAggregator:
 
         logger.info(
             "Réponse agrégée — %d datasets, %d insights, %d viz, %d recos, "
-            "partial=%s, failed=%d",
+            "%d warnings, partial=%s, failed=%d",
             len(response.data),
             len(response.insights),
             len(response.visualizations),
             len(response.recommendations),
+            len(response.warnings),
             response.partial,
             len(failed),
         )
@@ -127,7 +128,7 @@ class ResponseAggregator:
         step_id: str,
         data: Any,
     ) -> None:
-        """Collecte le DataFrame + méta depuis la sortie du SQL Agent."""
+        """Collecte le DataFrame + méta + warnings depuis la sortie du SQL Agent."""
         if not isinstance(data, dict):
             logger.warning(
                 "SQL Agent step %s : data n'est pas un dict (%s)",
@@ -146,13 +147,17 @@ class ResponseAggregator:
             }
         )
 
+        for warning in data.get("warnings", []):
+            if warning:
+                response.warnings.append(f"[{step_id}] {str(warning)}")
+
     @staticmethod
     def _collect_analysis_data(
         response: OrchestratorResponse,
         step_id: str,
         data: Any,
     ) -> None:
-        """Collecte insights, viz, recos depuis la sortie de l'Analyse Agent."""
+        """Collecte insights, viz, recos, warnings depuis la sortie de l'Analyse Agent."""
         if not isinstance(data, dict):
             logger.warning(
                 "Analyse Agent step %s : data n'est pas un dict (%s)",
@@ -172,3 +177,7 @@ class ResponseAggregator:
         for reco in data.get("recommendations", []):
             if reco:
                 response.recommendations.append(str(reco))
+
+        for warning in data.get("warnings", []):
+            if warning:
+                response.warnings.append(f"[{step_id}] {str(warning)}")

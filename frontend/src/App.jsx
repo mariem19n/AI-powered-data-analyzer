@@ -1,7 +1,11 @@
-import SemanticLayerDemo from "./SemanticLayerDemo";
+import AppErrorBoundary from "./components/AppErrorBoundary.jsx";
+import DashboardPage from "./components/DashboardPage.jsx";
+import "./App.css";
 
-function App() {
-  return <SemanticLayerDemo />;
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <DashboardPage />
+    </AppErrorBoundary>
+  );
 }
-
-export default App;

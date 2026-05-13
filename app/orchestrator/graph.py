@@ -34,6 +34,8 @@ import time
 import uuid
 from typing import Any
 
+from app.cache.policy import get_cache_ttl, should_cache_response
+from app.llm import reset_llm_request_id, set_llm_request_id
 from app.orchestrator.aggregator import ResponseAggregator
 from app.orchestrator.executor import AgentRunner, PlanExecutor
 from app.orchestrator.intent import IntentDetector
@@ -44,6 +46,10 @@ from app.orchestrator.schemas import (
     IntentType,
     OrchestratorResponse,
     ResponseMode,
+)
+from app.orchestrator.external_tool import (
+    ExternalResult,
+    TavilyExternalTool,
 )
 from app.orchestrator.state import OrchestratorState, make_initial_state
 
@@ -149,13 +155,29 @@ class Orchestrator:
         Returns:
             OrchestratorResponse prêt à être streamé au frontend.
         """
-        sid = session_id or str(uuid.uuid4())
-        state = make_initial_state(sid, question, user_context)
+        # Capturer le nombre d'appels LLM avant cette requête
+        # pour calculer le delta réel à la fin.
+        from app.llm import get_llm_client
 
-        if self._graph is not None:
-            state = await self._graph.ainvoke(state)
-        else:
-            state = await self._run_without_langgraph(state)
+        llm_metrics = get_llm_client().metrics
+        llm_calls_before = llm_metrics.total_calls
+        llm_trace_start = len(llm_metrics.call_traces)
+
+        sid = session_id or str(uuid.uuid4())
+        request_id = str(uuid.uuid4())
+        state = make_initial_state(sid, question, user_context)
+        state["request_id"] = request_id
+        state["llm_calls_before"] = llm_calls_before
+        state["llm_trace_start"] = llm_trace_start
+
+        token = set_llm_request_id(request_id)
+        try:
+            if self._graph is not None:
+                state = await self._graph.ainvoke(state)
+            else:
+                state = await self._run_without_langgraph(state)
+        finally:
+            reset_llm_request_id(token)
 
         return self._build_response(state)
 
@@ -194,12 +216,25 @@ class Orchestrator:
                 continue
 
             if cached is not None:
+                if not should_cache_response(cached):
+                    logger.info(
+                        "Cached final response ignored because policy failed",
+                        extra={"cache_key": cache_key, "mode": mode},
+                    )
+                    continue
                 state["cache_hit"] = True
                 state["cached_response"] = cached
-                logger.info("Cache HIT [%s:%s]", mode, q_hash)
+                logger.info(
+                    "Cache hit for final response",
+                    extra={"cache_key": cache_key, "mode": mode},
+                )
                 return state
 
         state["cache_hit"] = False
+        logger.info(
+            "Cache miss for final response",
+            extra={"question_hash": q_hash},
+        )
         return state
 
     async def _intent_node(
@@ -242,6 +277,42 @@ class Orchestrator:
         state["semantic_context"] = ctx_dict
         state["semantic_hash"] = ctx_dict.get("context_hash", "")
 
+        # ── Correction d'intent basée sur les périodes résolues ──
+        # Si l'intent est "forecasting" mais que toutes les périodes
+        # temporelles sont dans le passé → corriger en "aggregation".
+        # Le LLM d'intent ne connaît pas le contexte réel des dates,
+        # mais le TimeParser sait objectivement si c'est passé ou futur.
+        intent = state.get("intent")
+        if intent and intent.primary == IntentType.FORECASTING:
+            time_filters = ctx_dict.get("time_filters", [])
+            has_resolved_times = any(
+                tf.get("filter_clause") for tf in time_filters
+            )
+            all_past = has_resolved_times and all(
+                "CURRENT_DATE" not in tf.get("filter_clause", "").upper()
+                and "NOW()" not in tf.get("filter_clause", "").upper()
+                for tf in time_filters
+                if tf.get("filter_clause")
+            )
+            if all_past:
+                # Extraire les périodes pour un reasoning propre
+                period_texts = [
+                    tf.get("raw_text", "") for tf in time_filters
+                    if tf.get("raw_text")
+                ]
+                period_str = ", ".join(period_texts) if period_texts else "la période demandée"
+
+                logger.info(
+                    "Intent correction : forecasting → aggregation "
+                    "(toutes les périodes sont dans le passé)"
+                )
+                intent.primary = IntentType.AGGREGATION
+                intent.reasoning = (
+                    f"La question porte sur une période passée ({period_str}). "
+                    f"Extraction de données historiques, pas de prévision."
+                )
+                state["intent"] = intent
+
         # Cas 1 : le Semantic Layer a explicitement demandé une clarification
         # (unknown_terms = termes vraiment incompréhensibles)
         if ctx_dict.get("needs_clarification"):
@@ -255,7 +326,7 @@ class Orchestrator:
 
         # Cas 2 : Classification fine du résultat sémantique
         # pour décider du mode de réponse.
-        resolution = self._classify_semantic_result(ctx_dict, state)
+        resolution = self._classify_semantic_result(ctx_dict)
         state["response_mode"] = resolution["mode"]
 
         if resolution["mode"] == "clarify":
@@ -264,6 +335,29 @@ class Orchestrator:
                 reason=resolution["reason"],
                 suggestions=resolution.get("suggestions", []),
             )
+
+        # Cas 3 : Mode hybrid — lancer la recherche externe ICI
+        # avant de continuer vers plan_lookup. Le résultat externe
+        # sera combiné avec les résultats internes dans _build_response.
+        if resolution["mode"] == "hybrid" and self._external_tool is not None:
+            analytic_gaps = ctx_dict.get("analytic_gaps", [])
+            external_candidates = resolution.get("external_candidates", [])
+            search_query = " ".join(external_candidates) if external_candidates else state["raw_question"]
+
+            try:
+                ext_result = await self._external_tool.search(
+                    query=search_query,
+                    context=f"Intent: {state.get('intent')}, Gaps: {analytic_gaps}",
+                )
+                state["external_result"] = ext_result.to_dict()
+                logger.info(
+                    "Hybrid external search — %d sources, answer_len=%d",
+                    len(ext_result.sources),
+                    len(ext_result.answer),
+                )
+            except Exception as e:
+                logger.warning("Hybrid external search failed : %s", e)
+                state["external_result"] = None
 
         logger.info(
             "Semantic classification : %s — %s",
@@ -275,27 +369,21 @@ class Orchestrator:
     @staticmethod
     def _classify_semantic_result(
         ctx_dict: dict[str, Any],
-        state: OrchestratorState,
     ) -> dict[str, Any]:
         """
-        Classifie le résultat du Semantic Layer en 4 catégories :
+        Classifie le résultat du Semantic Layer pour décider du mode de réponse.
 
-          resolved_internal → données internes suffisantes → mode "internal"
-          resolved_external_candidate → terme reconnu mais absent en interne,
-              bon candidat pour Tavily → mode "external"
-          ambiguous → terme vague, pas assez d'info pour chercher en interne
-              NI en externe → demander clarification
-          hybrid → mix de données internes + gaps candidats pour enrichissement
-              externe → mode "hybrid"
+        Catégories :
+          internal → données internes suffisantes
+          external → terme reconnu mais absent en interne, candidat Tavily
+          hybrid → données internes + termes externes à enrichir
+          clarify → trop vague pour l'interne ET l'externe
 
-        La distinction clé :
-          - analytic_gaps avec des termes spécifiques et concrets
-            (ex: "fear and greed", "RSI divergence", "funding rate")
-            → external_candidate — Tavily peut trouver quelque chose d'utile
-          - analytic_gaps avec des termes vagues ou relationnels
-            (ex: "évolué de la même manière", "impact", "performance")
-            → ce sont des intent hints, pas des candidats externe
-            → le plan interne les gère via l'Analyse Agent
+        Retourne un dict avec :
+          mode : str — le mode de réponse
+          reason : str — justification (pour logs et debug)
+          external_candidates : list[str] — termes à chercher en externe (hybrid/external)
+          suggestions : list[str] — reformulations (clarify uniquement)
         """
         has_tables = bool(ctx_dict.get("tables"))
         has_entities = bool(ctx_dict.get("entity_filters"))
@@ -307,41 +395,50 @@ class Orchestrator:
 
         has_internal = has_tables or has_entities or has_metrics or has_columns
 
-        # Termes vagues qui sont des intent hints, pas des candidats web
+        # Si des unknown_terms existent, c'est que le Semantic Layer
+        # a des termes vraiment incompréhensibles — ça renforce le besoin
+        # de clarification si on n'a rien en interne non plus.
+
+        # Termes vagues = intent hints (à gérer en interne), pas des candidats web.
+        # On y ajoute les TERMES ANALYTIQUES liés aux intents : quand l'utilisateur
+        # dit "anomalies de BTC", le mot "anomalies" peut atterrir ici comme gap
+        # — il ne faut SURTOUT PAS chercher des articles externes sur "anomalies"
+        # (Tavily renverrait des résultats génériques sans rapport avec les
+        # données de l'utilisateur). Ces termes sont déjà capturés par l'intent
+        # classifier en amont et seront traités par l'Analysis Agent en interne.
         VAGUE_PATTERNS = {
+            # Vagues classiques
             "évolué", "évolution", "impact", "lien", "relation",
             "manière", "pareil", "similaire", "differently",
             "performance", "comportement", "tendance", "trend",
             "corrélation", "correlation", "cause", "effet",
+            # Termes analytiques liés aux intents — TOUJOURS gérés en interne
+            "anomalie", "anomalies", "anomaly",
+            "détection", "detect", "detection",
+            "prévision", "prévisions", "forecast", "prediction",
+            "comparaison", "compare", "comparison",
+            "diagnostic", "diagnose", "diagnosis",
+            "agrégation", "aggregation",
         }
 
         def is_external_candidate(gap: str) -> bool:
-            """
-            Un analytic_gap est candidat externe s'il est spécifique
-            et concret — pas un verbe vague ou un concept relationnel.
-            """
             gap_lower = gap.lower()
-            # Si le gap contient un pattern vague → pas candidat externe
             for pattern in VAGUE_PATTERNS:
                 if pattern in gap_lower:
                     return False
-            # Si le gap a au moins 2 mots et ne commence pas par un verbe
-            # commun → probablement un terme spécifique
             words = gap_lower.split()
             if len(words) >= 2:
                 return True
-            # Un seul mot mais pas vague → candidat
             return True
 
         external_candidates = [g for g in analytic_gaps if is_external_candidate(g)]
         vague_gaps = [g for g in analytic_gaps if not is_external_candidate(g)]
 
-        # Cas A : tout résolu en interne, pas de gaps
-        if has_internal and not analytic_gaps:
+        # Cas A : tout résolu en interne, pas de gaps ni d'unknowns
+        if has_internal and not analytic_gaps and not unknown_terms:
             return {"mode": "internal", "reason": "Tout résolu en interne"}
 
         # Cas B : données internes + gaps vagues (intent hints)
-        # → mode internal, les gaps vagues seront gérés par l'Analyse Agent
         if has_internal and vague_gaps and not external_candidates:
             return {
                 "mode": "internal",
@@ -351,8 +448,7 @@ class Orchestrator:
                 ),
             }
 
-        # Cas C : données internes + candidats externes
-        # → mode hybrid
+        # Cas C : données internes + candidats externes → hybrid
         if has_internal and external_candidates:
             return {
                 "mode": "hybrid",
@@ -360,10 +456,10 @@ class Orchestrator:
                     f"Données internes + termes externes "
                     f"({', '.join(external_candidates)})"
                 ),
+                "external_candidates": external_candidates,
             }
 
-        # Cas D : pas de données internes + candidats externes spécifiques
-        # → mode external — Tavily peut répondre
+        # Cas D : pas de données internes + candidats externes → external
         if not has_internal and external_candidates:
             return {
                 "mode": "external",
@@ -371,10 +467,25 @@ class Orchestrator:
                     f"Terme(s) non disponible(s) en interne : "
                     f"{', '.join(external_candidates)}"
                 ),
+                "external_candidates": external_candidates,
             }
 
-        # Cas E : pas de données internes + seulement des gaps vagues
-        # → ambiguous — ni l'interne ni l'externe ne peuvent aider
+        # Cas E : pas de données internes + unknown_terms
+        # → clarification obligatoire, termes incompréhensibles
+        if not has_internal and unknown_terms:
+            return {
+                "mode": "clarify",
+                "reason": (
+                    f"Termes non reconnus : {', '.join(unknown_terms)}"
+                ),
+                "suggestions": [
+                    "Vérifie l'orthographe de ta question",
+                    "Précise une crypto (ex: Bitcoin, Ethereum)",
+                    "Indique une métrique (ex: prix, volume, sentiment)",
+                ],
+            }
+
+        # Cas F : pas de données internes + seulement des gaps vagues
         if not has_internal and vague_gaps and not external_candidates:
             return {
                 "mode": "clarify",
@@ -389,9 +500,7 @@ class Orchestrator:
                 ],
             }
 
-        # Cas F : pas de données internes, pas de gaps du tout,
-        # mais la question a quand même un intent valide
-        # → external fallback — on tente Tavily
+        # Cas G : pas de données internes, pas de gaps du tout
         if not has_internal and not analytic_gaps:
             if confidence > 0.3:
                 return {
@@ -408,7 +517,7 @@ class Orchestrator:
                     ],
                 }
 
-        # Fallback — internal par défaut
+        # Fallback
         return {"mode": "internal", "reason": "Fallback — mode interne"}
 
     async def _external_node(
@@ -446,10 +555,10 @@ class Orchestrator:
             state["external_result"] = result.to_dict()
 
             logger.info(
-                "External search — provider=%s, source=%s, summary_len=%d",
+                "External search — provider=%s, source=%s, answer_len=%d",
                 result.provider,
                 result.source,
-                len(result.summary),
+                len(result.answer),
             )
         except Exception as e:
             logger.error("External tool failure : %s", e)
@@ -494,16 +603,28 @@ class Orchestrator:
     async def _plan_gen_node(
         self, state: OrchestratorState
     ) -> OrchestratorState:
+        from app.orchestrator.schemas import IntentType
+ 
         intent = state.get("intent")
         ctx = state.get("semantic_context")
-        if intent is None or ctx is None:
+ 
+        if intent is None:
             return state
-
+ 
+        # pour EXTERNAL_KNOWLEDGE, on n'a pas de SemanticContext
+        # (on a sauté le semantic_node). On injecte un ctx minimal.
+        if ctx is None:
+            if intent.primary == IntentType.EXTERNAL_KNOWLEDGE:
+                ctx = {"raw_question": state.get("raw_question", "")}
+            else:
+                # Comportement existant : pas de plan sans ctx pour les autres intents.
+                return state
+ 
         # Si un plan KG réutilisable existe, on le charge ; sinon on génère.
         if state.get("kg_plan"):
             try:
                 from app.orchestrator.schemas import ExecutionPlan
-
+ 
                 plan = ExecutionPlan.model_validate(state["kg_plan"])
                 plan.reused_from_kg = True
                 state["plan"] = plan
@@ -512,8 +633,11 @@ class Orchestrator:
                 logger.warning(
                     "KG plan invalide — régénération locale : %s", e
                 )
-
-        plan = self._planner.generate(intent, ctx)
+ 
+        # NOUVEAU : on passe external_result au planner pour les modes
+        # external (mono-step Analysis) et hybrid (SQL + Analysis avec payload).
+        external_result = state.get("external_result")
+        plan = self._planner.generate(intent, ctx, external_result=external_result)
         state["plan"] = plan
         return state
 
@@ -538,34 +662,28 @@ class Orchestrator:
     async def _cache_store_node(
         self, state: OrchestratorState
     ) -> OrchestratorState:
-        """Stocke la réponse dans Redis et enregistre le plan dans le KG."""
+        """Stocke la reponse dans Redis et enregistre le plan dans le KG."""
         final = state.get("final_response")
         if final is None:
             return state
 
-        # Ne pas cacher les réponses partielles ou les clarifications
-        if final.get("needs_clarification") or final.get("partial"):
-            return state
-
-        # Cache Redis — clé préfixée par mode, TTL adapté
         if self._cache_store_fn is not None:
             mode = state.get("response_mode", "internal")
             cache_key = f"{mode}:{state['question_hash']}"
 
-            # TTL plus court pour les réponses externes (données web
-            # changent plus vite que les données internes historiques)
-            if mode in ("external", "external_fallback"):
-                ttl = min(self._cache_ttl, 1800)  # max 30 min pour external
-            elif mode == "hybrid":
-                ttl = min(self._cache_ttl, 3600)  # max 1h pour hybrid
-            else:
-                ttl = self._cache_ttl  # TTL normal pour internal
-
             try:
-                await self._cache_store_fn(cache_key, final, ttl)
-                logger.info(
-                    "Cache STORE [%s] — TTL=%ds", cache_key, ttl
-                )
+                if should_cache_response(final):
+                    ttl = get_cache_ttl(final)
+                    await self._cache_store_fn(cache_key, final, ttl)
+                    logger.info(
+                        "Final response cached",
+                        extra={"cache_key": cache_key, "ttl": ttl},
+                    )
+                else:
+                    logger.info(
+                        "Final response not cached because policy failed",
+                        extra={"cache_key": cache_key},
+                    )
             except Exception as e:
                 logger.warning("Cache store failed : %s", e)
                 state.setdefault("warnings", []).append(f"cache_store: {e}")
@@ -598,6 +716,14 @@ class Orchestrator:
         intent = state.get("intent")
         if intent is None or intent.needs_clarification:
             return "clarify"
+ 
+        # intent EXTERNAL_KNOWLEDGE → on saute semantic, direct external.
+        # Le semantic layer ne saurait pas résoudre une question de définition
+        # qui ne parle pas de tables internes.
+        from app.orchestrator.schemas import IntentType
+        if intent.primary == IntentType.EXTERNAL_KNOWLEDGE:
+            return "external"
+ 
         return "semantic"
 
     @staticmethod
@@ -607,9 +733,10 @@ class Orchestrator:
         mode = state.get("response_mode", "internal")
         if mode == "external":
             return "external"
-        # Both "internal" and "hybrid" continue to plan_lookup.
-        # For hybrid, the external search happens in parallel later
-        # during execution (added as a step in the plan).
+        # internal et hybrid vont vers plan_lookup.
+        # Pour hybrid, la recherche externe a DÉJÀ été faite
+        # dans _semantic_node — le résultat est dans state["external_result"].
+        # _build_response combine les deux dans la réponse finale.
         return "plan_lookup"
 
     # ═════════════════════════════════════════════════════════
@@ -657,7 +784,11 @@ class Orchestrator:
         g.add_conditional_edges(
             "intent",
             self._route_after_intent,
-            {"clarify": "aggregate", "semantic": "semantic"},
+            {
+                "clarify": "aggregate",
+                "semantic": "semantic",
+                "external": "external",  # NOUVEAU
+            },
         )
 
         # semantic : 3-way routing
@@ -675,7 +806,7 @@ class Orchestrator:
         )
 
         # external → aggregate (pas de plan SQL, juste la réponse externe)
-        g.add_edge("external", "aggregate")
+        g.add_edge("external", "plan_gen")
 
         g.add_edge("plan_lookup", "plan_gen")
         g.add_edge("plan_gen", "execute")
@@ -738,44 +869,79 @@ class Orchestrator:
         duration = time.perf_counter() - started
         response_mode = state.get("response_mode", "internal")
 
+        # Calculer le nombre réel d'appels LLM pour cette requête
+        from app.llm import get_llm_client
+
+        llm_metrics = get_llm_client().metrics
+        llm_before = state.get("llm_calls_before", 0)
+        llm_trace_start = state.get("llm_trace_start", 0)
+        request_id = state.get("request_id")
+        llm_calls_actual = llm_metrics.total_calls - llm_before
+        llm_trace = llm_metrics.traces_since(llm_trace_start)
+        if request_id:
+            llm_trace = [
+                trace for trace in llm_trace
+                if trace.get("request_id") == request_id
+            ]
+            llm_calls_actual = len(llm_trace)
+        logger.info(
+            "Request LLM calls computed",
+            extra={"request_id": request_id, "llm_calls": llm_calls_actual},
+        )
+
         # Cache hit : retourner la réponse cachée
         if state.get("cache_hit") and state.get("cached_response"):
             cached = state["cached_response"]
             response = OrchestratorResponse.model_validate(cached)
             response.cache_hit = True
             response.total_duration_s = round(duration, 3)
+            response.llm_calls = 0  # cache hit = 0 appels LLM
+            response.llm_trace = []
             return response
 
         # Clarification
         if state.get("needs_clarification"):
-            return self._aggregator.aggregate(
+            response = self._aggregator.aggregate(
                 session_id=state["session_id"],
                 question=state["raw_question"],
                 intent=state.get("intent"),
                 plan=None,
                 step_results={},
                 total_duration_s=duration,
-                llm_calls=1 if state.get("intent") else 0,
+                llm_calls=llm_calls_actual,
                 clarification=state.get("clarification"),
             )
+            response.llm_trace = llm_trace
+            return response
 
         # Mode external : réponse 100% source externe
         if response_mode == "external":
             ext = state.get("external_result")
+            insights = []
+            if ext:
+                answer = ext.get("answer", "")
+                if answer:
+                    insights.append(answer)
+                source_urls = ext.get("source_urls", [])
+
             response = OrchestratorResponse(
                 session_id=state["session_id"],
                 question=state["raw_question"],
                 intent=state.get("intent"),
                 response_mode=ResponseMode.EXTERNAL,
                 external_data=ext,
-                insights=[ext.get("summary", "")] if ext else [],
+                insights=insights,
+                recommendations=[
+                    f"Source : {url}" for url in (source_urls if ext else [])
+                ],
                 source_disclaimer=(
                     ext.get("confidence_note", "")
                     if ext
                     else "Source externe non disponible."
                 ),
                 total_duration_s=round(duration, 3),
-                llm_calls=2,  # intent + external LLM
+                llm_calls=llm_calls_actual,
+                llm_trace=llm_trace,
             )
             return response
 
@@ -787,9 +953,10 @@ class Orchestrator:
             plan=state.get("plan"),
             step_results=state.get("step_results", {}),
             total_duration_s=duration,
-            llm_calls=1,
+            llm_calls=llm_calls_actual,
             cache_hit=False,
         )
+        response.llm_trace = llm_trace
 
         if response_mode == "hybrid":
             ext = state.get("external_result")

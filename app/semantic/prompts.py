@@ -222,15 +222,51 @@ Tu dois classer chaque terme dans exactement une seule des catégories suivantes
    - Ils signalent souvent une demande explicative ou causale
    - S’ils ne correspondent pas explicitement à un terme métier connu, mets-les dans `unresolved_terms`
 
-9. **Ignore les verbes d’intention.**
-   - Ne pas extraire :
-     - montre-moi
-     - affiche
-     - compare
-     - donne-moi
-     - show me
-     - display
-   - Ce sont des verbes d’action, pas des termes métier
+9. **Ignore les verbes d’intention ET les termes analytiques liés aux intents.**
+   - Ne pas extraire ces **verbes d’action** :
+     - montre-moi, montre, affiche, compare, donne-moi
+     - show me, display, give me
+   - Ne pas extraire ces **termes analytiques** (ils correspondent à des intents et sont déjà capturés en amont par le classifier d’intent — ils ne sont **jamais** des `business_terms` ni des `unresolved_terms`) :
+     - anomalie, anomalies, anomaly, anomalies (FR/EN)
+     - détecter, détection, detect, detection
+     - corrélation, corréler, correlation, correlate
+     - prévision, prévisions, prévoir, prédire, forecast, prediction
+     - comparaison, comparer, compare, comparison
+     - tendance, tendances, trend, trends
+     - diagnostic, diagnostiquer, diagnose, diagnosis
+     - agrégation, agréger, aggregation, aggregate
+   - Ces termes ne sont **ni des termes métier, ni des métriques, ni des entités** :
+     ce sont des **opérations analytiques** demandées sur les données.
+   - Ils doivent être **complètement ignorés** lors de l’extraction.
+   - ⚠ Ne les mets **jamais** dans `unresolved_terms` : leur absence du KG est normale et attendue.
+ 
+### Exemple — termes analytiques ignorés correctement
+ 
+Question: detecte les anomalies de Bitcoin en mars 2025
+Réponse:
+{{
+  "business_terms": [],
+  "entities": ["Bitcoin"],
+  "time_periods": ["mars 2025"],
+  "metrics": [],
+  "unresolved_terms": [],
+  "needs_clarification": false
+}}
+(Note: "detecte" et "anomalies" sont des termes analytiques liés à l’intent
+`anomaly_detection`. Ils ne doivent **pas** apparaître dans la sortie.)
+ 
+Question: prévois le prix du Bitcoin pour avril 2025
+Réponse:
+{{
+  "business_terms": [],
+  "entities": ["Bitcoin"],
+  "time_periods": ["avril 2025"],
+  "metrics": ["prix"],
+  "unresolved_terms": [],
+  "needs_clarification": false
+}}
+(Note: "prévois" est un terme analytique lié à l’intent `forecasting`,
+il est ignoré. "prix" est une vraie métrique, elle est extraite.)
 
 10. **Périodes temporelles.**
    - Extrais les références temporelles telles qu’elles apparaissent

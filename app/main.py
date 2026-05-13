@@ -6,9 +6,11 @@ Sprint 2 : intègre l'Orchestrator LangGraph avec le pipeline
 Semantic Layer du Sprint 1.
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+import psycopg2
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -17,6 +19,47 @@ from app.config import settings
 from app.health import check_all_services
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Helpers de démarrage résilient ──────────────────────────
+
+
+async def _wait_for(
+    name: str,
+    probe,
+    *,
+    retries: int = 30,
+    delay: float = 2.0,
+    is_async: bool = True,
+):
+    """
+    Retry une fonction de connectivité jusqu'à ce qu'elle réussisse.
+
+    Pourquoi : même avec les healthchecks Docker bien configurés,
+    il peut y avoir une fenêtre de quelques secondes entre
+    "service marqué healthy" et "service réellement prêt à
+    accepter une connexion applicative" (ex : Neo4j Bolt vs HTTP,
+    pool Postgres pas encore rempli, etc). Plutôt que de crasher
+    l'API et entrer en boucle de restart, on retente proprement.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            if is_async:
+                await probe()
+            else:
+                await asyncio.to_thread(probe)
+            logger.info("%s : connecté (tentative %d).", name, attempt)
+            return
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning(
+                "%s : indisponible (tentative %d/%d) — %s",
+                name, attempt, retries, e.__class__.__name__,
+            )
+            await asyncio.sleep(delay)
+    logger.error("%s : impossible de se connecter après %d tentatives.", name, retries)
+    raise RuntimeError(f"{name} unreachable") from last_err
 
 
 # ─── Lifespan : connexion/déconnexion aux services ───────────
@@ -29,10 +72,12 @@ async def lifespan(app: FastAPI):
     from app.db.neo4j import neo4j_driver
     from app.db.redis import redis_client
 
-    # ── 1. Connexion aux services ─────────────────────────────
-    await pg_pool.connect()
-    neo4j_driver.verify_connectivity()
-    await redis_client.ping()
+    # ── 1. Connexion aux services (avec retry) ────────────────
+    await _wait_for("PostgreSQL", pg_pool.connect, is_async=True)
+    await _wait_for(
+        "Neo4j", neo4j_driver.verify_connectivity, is_async=False
+    )
+    await _wait_for("Redis", redis_client.ping, is_async=True)
     logger.info("Tous les services sont connectés.")
 
     # ── 2. Initialisation du Knowledge Graph ──────────────────
@@ -53,32 +98,70 @@ async def lifespan(app: FastAPI):
     from app.orchestrator.graph import setup_orchestrator
     from app.orchestrator.executor import AgentRunner
 
-    # Agents placeholder — à remplacer par les vrais agents
-    # quand le SQL Agent et l'Analyse Agent seront implémentés.
-    class PlaceholderSQLAgent(AgentRunner):
-        async def run(self, instruction, upstream_results):
-            logger.warning(
-                "PlaceholderSQLAgent appelé — le vrai SQL Agent "
-                "n'est pas encore implémenté."
-            )
-            return {
-                "records": [],
-                "columns": [],
-                "row_count": 0,
-                "sql": "-- placeholder",
-            }
+    # SQL Agent — le vrai, avec template hybride + LLM + sécurité
+    from app.agents.sql_agent import SQLAgent
+    from app.agents.sql_executor import DirectSQLExecutor
 
-    class PlaceholderAnalysisAgent(AgentRunner):
+    # Extraire host/port depuis database_url de la config
+    # Format: postgresql+asyncpg://user:pass@host:port/dbname
+    from urllib.parse import urlparse
+
+    db_url = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+    parsed = urlparse(db_url)
+
+    sql_executor = DirectSQLExecutor(
+        host=parsed.hostname or "postgres",
+        port=parsed.port or 5432,
+        dbname=parsed.path.lstrip("/") if parsed.path else "analyzer_db",
+        user=parsed.username or "analyzer",
+        password=parsed.password or "analyzer_pg_123",
+    )
+    sql_agent = SQLAgent(
+        executor=sql_executor,
+        redis_client=redis_client,
+    )
+    logger.info("SQLAgent initialisé avec DirectSQLExecutor.")
+
+    # Factory pour ouvrir une connexion read-only PostgreSQL.
+    # Utilisée par l'AnalysisAgent pour l'enrichissement GDELT
+    # (lecture des articles publiés aux dates d'anomalies).
+    # On utilise psycopg2 directement (pas asyncpg) car la task
+    # est synchrone et n'a pas besoin d'un pool partagé.
+    def get_pg_readonly_connection():
+        return psycopg2.connect(
+            host=parsed.hostname or "postgres",
+            port=parsed.port or 5432,
+            dbname=parsed.path.lstrip("/") if parsed.path else "analyzer_db",
+            user=parsed.username or "analyzer",
+            password=parsed.password or "analyzer_pg_123",
+        )
+
+    # Analyse Agent — vrai runner Sprint 3, adapté au contrat async du PlanExecutor
+    from app.agents.analysis import AnalysisAgent
+
+    class AsyncAnalysisAgentAdapter(AgentRunner):
+        def __init__(self, analysis_agent: AnalysisAgent):
+            self._analysis_agent = analysis_agent
+
         async def run(self, instruction, upstream_results):
-            logger.warning(
-                "PlaceholderAnalysisAgent appelé — le vrai Analyse Agent "
-                "n'est pas encore implémenté."
+            response = await asyncio.to_thread(
+                self._analysis_agent.run,
+                instruction=instruction,
+                upstream_results=upstream_results,
+                semantic_context=instruction.get("semantic_context", {}),
             )
-            return {
-                "insights": ["Analyse non disponible (placeholder)"],
-                "visualizations": [],
-                "recommendations": [],
-            }
+            return response.to_dict() if hasattr(response, "to_dict") else response
+
+    analysis_agent = AsyncAnalysisAgentAdapter(
+        AnalysisAgent.build_default(
+            neo4j_driver=neo4j_driver,
+            db_session_factory=get_pg_readonly_connection,
+        )
+    )
+    logger.info(
+        "AnalysisAgent initialisé et branché sur l'Orchestrator "
+        "(enrichissement GDELT activé)."
+    )
 
     # Fonctions Redis pour le cache de l'Orchestrator
     async def cache_check(question_hash: str):
@@ -104,8 +187,8 @@ async def lifespan(app: FastAPI):
     # Setup de l'Orchestrator
     orchestrator = setup_orchestrator(
         agents={
-            AgentType.SQL_AGENT: PlaceholderSQLAgent(),
-            AgentType.ANALYSIS_AGENT: PlaceholderAnalysisAgent(),
+            AgentType.SQL_AGENT: sql_agent,
+            AgentType.ANALYSIS_AGENT: analysis_agent,
         },
         semantic_build_fn=semantic_pipeline.run,
         external_tool=external_tool,

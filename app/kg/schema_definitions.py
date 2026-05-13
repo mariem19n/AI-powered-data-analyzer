@@ -8,7 +8,7 @@ Contient :
   TABLE_JOINS    — relations entre tables
   ENTITIES       — entités métier (cryptos, séries FRED, sources médias)
   BUSINESS_TERMS — termes métier + synonymes + résolution vers colonnes
-  METRICS        — formules SQL calculées
+  METRICS        — formules SQL calculées (+ requires_terms d'activation)
   BUSINESS_RULES — règles implicites toujours appliquées
   TIME_PERIODS   — expressions temporelles en langage naturel
 """
@@ -427,7 +427,17 @@ BUSINESS_TERMS = [
 ]
 
 # ─── Métriques calculées ──────────────────────────────────────
-# Structure : (name, domain, description, sql_formula, source_table)
+# Structure :
+#   (name, domain, description, sql_formula, source_table, requires_terms)
+#
+# requires_terms : list[str]
+#   Liste de termes qui activent cette métrique. Sémantique OR : il suffit
+#   qu'AU MOINS UN soit présent dans les termes extraits de la question.
+#   Si vide ou None, la métrique est toujours activable.
+#
+#   Utilisé pour désambiguïser des métriques au nom trop générique
+#   (ex: "corrélation" ne devrait matcher correlation_prix_sentiment QUE
+#   si la question parle explicitement de sentiment/news/media/tone/gdelt).
 
 METRICS = [
     ("rendement_mensuel",
@@ -435,56 +445,66 @@ METRICS = [
      "Variation du prix de clôture en % sur 30 jours glissants",
      "((close_usd - LAG(close_usd, 30) OVER (PARTITION BY symbol ORDER BY date)) "
      "/ LAG(close_usd, 30) OVER (PARTITION BY symbol ORDER BY date)) * 100",
-     "fact_crypto_daily"),
+     "fact_crypto_daily",
+     []),
 
     ("volatilite_30j",
      "crypto",
      "Volatilité sur 30 jours glissants = écart-type des variations journalières",
      "STDDEV(daily_change_pct) OVER (PARTITION BY symbol ORDER BY date ROWS 29 PRECEDING)",
-     "stg_daily_metrics"),
+     "stg_daily_metrics",
+     []),
 
     ("moyenne_mobile_7j",
      "crypto",
      "Moyenne mobile du prix de clôture sur 7 jours",
      "AVG(close_usd) OVER (PARTITION BY symbol ORDER BY date ROWS 6 PRECEDING)",
-     "fact_crypto_daily"),
+     "fact_crypto_daily",
+     []),
 
     ("moyenne_mobile_30j",
      "crypto",
      "Moyenne mobile du prix de clôture sur 30 jours",
      "AVG(close_usd) OVER (PARTITION BY symbol ORDER BY date ROWS 29 PRECEDING)",
-     "fact_crypto_daily"),
+     "fact_crypto_daily",
+     []),
 
     ("range_journalier",
      "crypto",
      "Range journalier en USD = high_usd - low_usd",
      "high_usd - low_usd",
-     "fact_crypto_daily"),
+     "fact_crypto_daily",
+     []),
 
     ("sentiment_moyen_crypto",
      "sentiment",
      "Sentiment médiatique moyen des articles crypto_direct",
      "AVG(avg_tone) FILTER (WHERE keyword IN ('ECON_BITCOINS', 'ECON_CRYPTOCURRENCY'))",
-     "agg_daily_sentiment"),
+     "agg_daily_sentiment",
+     []),
 
     ("sentiment_moyen_macro",
      "sentiment",
      "Sentiment médiatique moyen des articles macro",
      "AVG(avg_tone) FILTER (WHERE keyword IN "
      "('ECON_CENTRALBANK', 'ECON_INFLATION', 'ECON_STOCKMARKET', 'GOV_REGULATION_FINANCIAL'))",
-     "agg_daily_sentiment"),
+     "agg_daily_sentiment",
+     []),
 
     ("correlation_prix_sentiment",
      "analytics",
-     "Corrélation de Pearson entre prix de clôture et sentiment du même jour",
+     "Corrélation de Pearson entre prix de clôture et sentiment du même jour. "
+     "S'active uniquement si la question mentionne explicitement sentiment, "
+     "news, media, tone ou GDELT.",
      "CORR(f.close_usd, s.avg_tone) FROM fact_crypto_daily f "
      "JOIN agg_daily_sentiment s ON f.date = s.date "
      "WHERE f.symbol = :symbol",
-     "fact_crypto_daily"),
+     "fact_crypto_daily",
+     ["sentiment", "news", "media", "tone", "gdelt"]),
 ]
 
 # ─── Règles métier implicites ─────────────────────────────────
-# Structure : (rule_id, table, description, sql_condition)
+# Structure : (rule_id, table, description, sql_condition, rule_type)
 
 BUSINESS_RULES = [
     ("exclude_zero_volume",
@@ -492,37 +512,37 @@ BUSINESS_RULES = [
      "Exclure les jours sans volume — données manquantes ou marchés fermés",
      "volume > 0",
      "sql_predicate"),
- 
+
     ("active_cryptos_only",
      "dim_crypto",
      "Utiliser uniquement les cryptos actives dans le suivi",
      "is_active = true",
      "sql_predicate"),
- 
+
     ("valid_fred_values",
      "fact_fred_observation",
      "Exclure les observations FRED avec valeur NULL — données non encore publiées",
      "value IS NOT NULL",
      "sql_predicate"),
- 
+
     ("enriched_articles_only",
      "article_enrichment",
      "Pour les analyses de contenu LLM, utiliser uniquement les articles enrichis avec succès",
      "status = 'ok'",
      "sql_predicate"),
- 
+
     ("crypto_direct_sentiment",
      "agg_daily_sentiment",
      "Pour le sentiment crypto, filtrer sur les thèmes crypto_direct",
      "keyword IN ('ECON_BITCOINS', 'ECON_CRYPTOCURRENCY')",
      "sql_predicate"),
- 
+
     ("macro_sentiment",
      "agg_daily_sentiment",
      "Pour le sentiment macro, filtrer sur les thèmes macro",
      "keyword IN ('ECON_CENTRALBANK', 'ECON_INFLATION', 'ECON_STOCKMARKET', 'GOV_REGULATION_FINANCIAL')",
      "sql_predicate"),
- 
+
     ("use_parent_table",
      "fact_crypto_daily",
      "Toujours interroger la table parent fact_crypto_daily, "
@@ -531,7 +551,7 @@ BUSINESS_RULES = [
      "Utiliser fact_crypto_daily avec WHERE symbol = :symbol, "
      "ne jamais interroger les partitions fact_crypto_daily_btc/eth/etc.",
      "query_guideline"),
- 
+
     ("market_cap_365_days_only",
      "fact_crypto_daily",
      "market_cap_usd est NULL avant les 365 derniers jours — "

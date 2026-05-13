@@ -66,6 +66,9 @@ class OrchestratorState(TypedDict, total=False):
     final_response: dict[str, Any] | None
 
     # ── Métriques ────────────────────────────────────────────
+    request_id: str
+    llm_calls_before: int
+    llm_trace_start: int
     started_at: float
     errors: list[str]
     warnings: list[str]
@@ -99,6 +102,9 @@ def make_initial_state(
         response_mode="internal",
         external_result=None,
         final_response=None,
+        request_id="",
+        llm_calls_before=0,
+        llm_trace_start=0,
         started_at=time.perf_counter(),
         errors=[],
         warnings=[],

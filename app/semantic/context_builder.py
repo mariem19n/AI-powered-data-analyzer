@@ -79,7 +79,7 @@ class TimeFilter:
     """Filtre temporel pour la clause WHERE."""
     expression: str
     filter_clause: str
-    is_canonical: bool = True
+    is_resolved: bool = True 
     raw_text: str = ""
 
 
@@ -292,7 +292,7 @@ class SemanticContextBuilder:
             TimeFilter(
                 expression=tp.sql_expression,
                 filter_clause=tp.filter_expression,
-                is_canonical=tp.is_canonical,
+                is_resolved=tp.is_resolved,
                 raw_text=tp.name,
             )
             for tp in resolved.time_periods
@@ -426,7 +426,7 @@ class SemanticContextBuilder:
             "metrics": [(m.name, m.source_table) for m in ctx.metrics],
             "columns": [(c.table, c.column) for c in ctx.columns],
             "time_filters": [
-                (t.filter_clause, t.is_canonical) for t in ctx.time_filters
+                (t.filter_clause, t.is_resolved) for t in ctx.time_filters
             ],
             "implicit_conditions": sorted(ctx.implicit_conditions),
         }
