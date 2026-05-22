@@ -8,6 +8,8 @@ Semantic Layer du Sprint 1.
 
 import asyncio
 import logging
+from datetime import date, datetime
+from decimal import Decimal
 from contextlib import asynccontextmanager
 
 import psycopg2
@@ -17,8 +19,22 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.health import check_all_services
+from app.orchestrator.conversation_context import ConversationContextResolver
+
+from app.api.routes.feedback import router as feedback_router
 
 logger = logging.getLogger(__name__)
+
+MAIN_CRYPTO_SYMBOLS = ("BTC", "ETH", "BNB", "XRP", "ADA", "SOL", "DOT", "DOGE", "AVAX", "LINK")
+
+
+def _to_json_value(value):
+    """Convertit les types PostgreSQL non JSON en valeurs simples."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
 
 
 # ─── Helpers de démarrage résilient ──────────────────────────
@@ -183,6 +199,14 @@ async def lifespan(app: FastAPI):
             "TAVILY_API_KEY manquant — les questions hors périmètre "
             "ne pourront pas être traitées via recherche web."
         )
+    
+    context_resolver = ConversationContextResolver(
+        redis_client=redis_client,
+        llm_client=None,  # Règles-first, LLM optionnel — à brancher si besoin
+        max_turns=3,
+        ttl_seconds=1800,  # 30 minutes
+    )
+    logger.info("ConversationContextResolver initialisé (max_turns=3, TTL=30min).")
 
     # Setup de l'Orchestrator
     orchestrator = setup_orchestrator(
@@ -192,6 +216,7 @@ async def lifespan(app: FastAPI):
         },
         semantic_build_fn=semantic_pipeline.run,
         external_tool=external_tool,
+        context_resolver=context_resolver,
         cache_check_fn=cache_check,
         cache_store_fn=cache_store,
         # KG plan lookup/store — sera branché quand le Feedback Agent
@@ -229,6 +254,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(feedback_router)
 
 
 # ─── Routes ───────────────────────────────────────────────────
@@ -245,6 +271,62 @@ async def health():
     status = await check_all_services()
     http_status = 200 if status["status"] == "healthy" else 503
     return JSONResponse(content=status, status_code=http_status)
+
+
+@app.get("/api/crypto/latest-prices")
+async def latest_crypto_prices():
+    """Retourne les derniers prix disponibles pour les principales cryptos."""
+    from app.db.postgres import pg_pool
+
+    query = """
+        WITH ranked_prices AS (
+            SELECT
+                f.symbol,
+                COALESCE(dc.name, f.symbol) AS name,
+                f.date,
+                f.close_usd AS price_usd,
+                f.volume,
+                LAG(f.close_usd) OVER (
+                    PARTITION BY f.symbol
+                    ORDER BY f.date
+                ) AS prev_close_usd,
+                ROW_NUMBER() OVER (
+                    PARTITION BY f.symbol
+                    ORDER BY f.date DESC
+                ) AS rn
+            FROM fact_crypto_daily f
+            LEFT JOIN dim_crypto dc ON dc.symbol = f.symbol
+            WHERE f.symbol = ANY($1::text[])
+        )
+        SELECT
+            symbol,
+            name,
+            price_usd,
+            volume,
+            date,
+            CASE
+                WHEN prev_close_usd IS NULL OR prev_close_usd = 0 THEN NULL
+                ELSE ROUND(((price_usd - prev_close_usd) / ABS(prev_close_usd) * 100)::numeric, 4)
+            END AS change_24h_pct
+        FROM ranked_prices
+        WHERE rn = 1
+        ORDER BY array_position($1::text[], symbol);
+    """
+
+    async with pg_pool.pool.acquire() as conn:
+        rows = await conn.fetch(query, list(MAIN_CRYPTO_SYMBOLS))
+
+    return [
+        {
+            "symbol": row["symbol"],
+            "name": row["name"],
+            "price_usd": _to_json_value(row["price_usd"]),
+            "volume": _to_json_value(row["volume"]),
+            "date": _to_json_value(row["date"]),
+            "change_24h_pct": _to_json_value(row["change_24h_pct"]),
+        }
+        for row in rows
+    ]
 
 
 @app.get("/neo4j/status")

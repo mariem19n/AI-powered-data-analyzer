@@ -4,15 +4,32 @@ import ChartCard from "./ChartCard.jsx";
 import InsightsList from "./InsightsList.jsx";
 import ClarificationChips from "./ClarificationChips.jsx";
 import DetailsDrawer from "./DetailsDrawer.jsx";
+import AnalysisStatsModal from "./AnalysisStatsModal.jsx";
+import ForecastUncertaintyBadge from "./ForecastUncertaintyBadge.jsx";
+import ProvenanceModal from "./ProvenanceModal.jsx";
+import ExternalSourceCard from "./ExternalSourceCard.jsx";
 import {
   computeMarketSummary,
   extractRecords,
   formatCurrency,
   formatPercent,
 } from "../utils/marketSummary.js";
+import {
+  buildForecastSummaryCards,
+  buildForecastUncertaintyBadge,
+} from "../utils/forecastSummary.js";
+import {
+  getExternalSources,
+  getResponseMode,
+  shouldShowDetails,
+  shouldShowModelEvaluation,
+  shouldShowProvenance,
+} from "../utils/externalSources.js";
 
 export default function AssistantBubble({ response, isError, errorMessage, onSubmit }) {
   const [showDetails, setShowDetails] = useState(false);
+  const [showAnalysisStats, setShowAnalysisStats] = useState(false);
+  const [showProvenance, setShowProvenance] = useState(false);
 
   if (isError) {
     return (
@@ -26,6 +43,8 @@ export default function AssistantBubble({ response, isError, errorMessage, onSub
 
   const records = extractRecords(response);
   const summary = computeMarketSummary(records);
+  const forecastSummaryCards = buildForecastSummaryCards(response, summary);
+  const forecastUncertaintyBadge = buildForecastUncertaintyBadge(response);
 
   const insights = Array.isArray(response?.insights) ? response.insights.filter(Boolean) : [];
   const recommendations = Array.isArray(response?.recommendations)
@@ -36,11 +55,13 @@ export default function AssistantBubble({ response, isError, errorMessage, onSub
     : [];
 
   const needsClarification = Boolean(response?.needs_clarification);
-  const isExternal = response?.response_mode === "external";
-  const sourceUrl =
-    response?.external_data?.url ??
-    response?.external_data?.source ??
-    null;
+  const hasModelEvaluation = shouldShowModelEvaluation(response);
+  const externalSources = getExternalSources(response);
+  const hasProvenance = shouldShowProvenance(response);
+  const hasDetails = shouldShowDetails(response);
+  const responseMode = getResponseMode(response);
+  const isExternal = responseMode === "external" || responseMode === "hybrid";
+  const visibleExternalSources = isExternal ? externalSources : [];
 
   const mainText =
     insights[0] ??
@@ -61,7 +82,22 @@ export default function AssistantBubble({ response, isError, errorMessage, onSub
 
         <p className="bubble-text">{mainText}</p>
 
-        {summary && (
+        {forecastUncertaintyBadge && (
+          <ForecastUncertaintyBadge badge={forecastUncertaintyBadge} />
+        )}
+
+        {forecastSummaryCards ? (
+          <div className="kpi-row">
+            {forecastSummaryCards.map((card) => (
+              <KPICard
+                key={card.label}
+                label={card.label}
+                value={card.value}
+                positive={card.positive}
+              />
+            ))}
+          </div>
+        ) : summary && (
           <div className="kpi-row">
             <KPICard
               label="Price"
@@ -104,28 +140,63 @@ export default function AssistantBubble({ response, isError, errorMessage, onSub
           />
         )}
 
-        {isExternal && sourceUrl && (
-          <a
-            href={sourceUrl}
-            className="source-link"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            View source →
-          </a>
+        {visibleExternalSources.length > 0 && (
+          <div className="external-source-preview">
+            <div className="external-source-preview-heading">
+              <span>Sources externes</span>
+              <strong>{visibleExternalSources.length}</strong>
+            </div>
+            <div className="external-source-grid">
+              {visibleExternalSources.slice(0, 5).map((src, i) => (
+                <ExternalSourceCard key={`${src.url}-${i}`} source={src} compact />
+              ))}
+            </div>
+          </div>
         )}
 
         <div className="bubble-footer">
-          <button
-            type="button"
-            className="details-btn"
-            onClick={() => setShowDetails((v) => !v)}
-          >
-            {showDetails ? "Hide details" : "Details"}
-          </button>
+          {hasModelEvaluation && (
+            <button
+              type="button"
+              className="model-evaluation-btn"
+              onClick={() => setShowAnalysisStats(true)}
+            >
+              Show model evaluation
+            </button>
+          )}
+          {hasProvenance && (
+            <button
+              type="button"
+              className="provenance-btn"
+              onClick={() => setShowProvenance(true)}
+            >
+              Sources et méthode
+            </button>
+          )}
+          {hasDetails && (
+            <button
+              type="button"
+              className="details-btn"
+              onClick={() => setShowDetails((v) => !v)}
+            >
+              {showDetails ? "Hide details" : "Details"}
+            </button>
+          )}
         </div>
 
         {showDetails && <DetailsDrawer response={response} />}
+        {showAnalysisStats && (
+          <AnalysisStatsModal
+            analysisStats={response?.analysis_stats}
+            onClose={() => setShowAnalysisStats(false)}
+          />
+        )}
+        {showProvenance && (
+          <ProvenanceModal
+            response={response}
+            onClose={() => setShowProvenance(false)}
+          />
+        )}
       </div>
     </div>
   );

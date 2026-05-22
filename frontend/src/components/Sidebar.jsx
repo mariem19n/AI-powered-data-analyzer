@@ -1,4 +1,4 @@
-export default function Sidebar({ apiStatus, apiBase, isOpen, onClose, onNewConversation }) {
+export default function Sidebar({ isOpen, onClose, onNewConversation }) {
   return (
     <>
       {isOpen && (

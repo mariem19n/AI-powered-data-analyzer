@@ -73,6 +73,65 @@ _DEFAULT_ZMAX = 1.0
 _DEFAULT_SHOW_VALUES = True
 _DEFAULT_ANNOTATION_BOLD_THRESHOLD = 0.7
 
+# Fallbacks utilisés si le thème n'expose pas ces clés.
+_FALLBACK_TEXT_DARK = "#333333"
+_FALLBACK_TEXT_LIGHT = "#ffffff"
+_FALLBACK_TEXT_MUTED = "#888888"
+_FALLBACK_BACKGROUND = "white"
+_FALLBACK_FONT_FAMILY = "Inter, sans-serif"
+
+
+# ─── Helper de lecture du thème ─────────────────────────────────────────────
+
+
+def _theme_get(theme: Any, key: str, default: str) -> str:
+    """
+    Lit une valeur du thème de manière défensive.
+
+    Supporte trois formes de thème :
+      1. dict plat :        {"text": "#333", "background": "white", ...}
+      2. dict imbriqué :    {"colors": {"text": "#333", ...}, "font_family": ...}
+      3. objet (dataclass) : theme.colors.text, theme.font_family
+
+    Cherche `key` dans cet ordre :
+      - theme[key] si dict plat
+      - theme["colors"][key] si dict avec sous-bloc "colors"
+      - theme.colors.<key> si objet avec attribut colors
+      - theme.<key> si objet avec attribut direct (pour font_family)
+    """
+    if theme is None:
+        return default
+
+    if isinstance(theme, dict):
+        # Cas 1 : dict plat
+        if key in theme and theme[key]:
+            return str(theme[key])
+        # Cas 2 : dict imbriqué sous "colors"
+        colors_block = theme.get("colors")
+        if isinstance(colors_block, dict) and key in colors_block and colors_block[key]:
+            return str(colors_block[key])
+        return default
+
+    # Cas 3 : objet
+    colors_attr = getattr(theme, "colors", None)
+    if colors_attr is not None:
+        # Sous-objet : theme.colors.<key>
+        val = getattr(colors_attr, key, None)
+        if val:
+            return str(val)
+        # Sous-dict : theme.colors[key]
+        if isinstance(colors_attr, dict):
+            val = colors_attr.get(key)
+            if val:
+                return str(val)
+
+    # Attribut direct sur l'objet
+    val = getattr(theme, key, None)
+    if val:
+        return str(val)
+
+    return default
+
 
 # ─── Constructeur principal ────────────────────────────────────────────────
 
@@ -207,8 +266,8 @@ def _build_value_annotations(
     Couleur adaptative : blanc sur fond très saturé, sinon couleur du thème.
     """
     out: list[dict[str, Any]] = []
-    text_color_dark = getattr(theme.colors, "text", "#333333")
-    text_color_light = "#ffffff"
+    text_color_dark = _theme_get(theme, "text", _FALLBACK_TEXT_DARK)
+    text_color_light = _FALLBACK_TEXT_LIGHT
 
     for i, row_label in enumerate(labels):
         for j, col_label in enumerate(labels):
@@ -254,11 +313,16 @@ def _build_layout(
     # pour que les cases restent lisibles. Bornes conservatives.
     side_px = max(360, min(720, 80 * n_labels + 200))
 
+    text_color = _theme_get(theme, "text", _FALLBACK_TEXT_DARK)
+    muted_color = _theme_get(theme, "text_muted", _FALLBACK_TEXT_MUTED)
+    background = _theme_get(theme, "background", _FALLBACK_BACKGROUND)
+    font_family = _theme_get(theme, "font_family", _FALLBACK_FONT_FAMILY)
+
     full_title = title
     if subtitle:
         full_title = (
             f"{title}<br><span style='font-size:0.8em; "
-            f"color:{getattr(theme.colors, 'text_muted', '#888')}'>"
+            f"color:{muted_color}'>"
             f"{subtitle}</span>"
         )
 
@@ -269,7 +333,7 @@ def _build_layout(
             "xanchor": "center",
             "font": {
                 "size": 16,
-                "color": getattr(theme.colors, "text", "#333"),
+                "color": text_color,
             },
         },
         "xaxis": {
@@ -288,12 +352,12 @@ def _build_layout(
         "width": side_px,
         "height": side_px,
         "margin": {"l": 80, "r": 40, "t": 80, "b": 80},
-        "paper_bgcolor": getattr(theme.colors, "background", "white"),
-        "plot_bgcolor": getattr(theme.colors, "background", "white"),
+        "paper_bgcolor": background,
+        "plot_bgcolor": background,
         "font": {
-            "family": getattr(theme, "font_family", "Inter, sans-serif"),
+            "family": font_family,
             "size": 12,
-            "color": getattr(theme.colors, "text", "#333"),
+            "color": text_color,
         },
         "annotations": annotations,
     }

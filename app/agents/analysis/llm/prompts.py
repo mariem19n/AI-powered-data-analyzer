@@ -270,6 +270,12 @@ suggérer "consulter [source spécifique] pour approfondir". Sinon liste vide.
 """
 
 
+_EXPLAIN_KEYWORDS = (
+    "explique", "expliquer", "c'est quoi", "qu'est-ce", "définition",
+    "define", "definition", "explain", "what is", "c est quoi",
+)
+
+
 def _build_external_summary_user(
     *,
     stats: dict[str, Any],
@@ -292,6 +298,17 @@ def _build_external_summary_user(
 
     parts.append("# Question de l'utilisateur")
     parts.append(query or "(question non fournie)")
+
+    is_explanatory = any(kw in query.lower() for kw in _EXPLAIN_KEYWORDS)
+    if is_explanatory:
+        parts.append(
+            "\n⚠ PRIORITÉ — La question demande une EXPLICATION / DÉFINITION du concept. "
+            "Tes insights doivent d'abord expliquer CE QU'EST le concept "
+            "(fonctionnement, échelle, interprétation), AVANT tout contexte "
+            "d'actualité de marché. "
+            "Ne rapporte PAS des événements de marché récents comme réponse principale : "
+            "c'est une question pédagogique, pas une question d'actualité."
+        )
 
     parts.append("\n# Sources web disponibles")
     if not sources:
@@ -873,3 +890,182 @@ register_prompt(
         build_user=_build_correlation_user,
     )
 )
+
+
+_FORECASTING_SYSTEM = """\
+You are a forecasting analyst for an AI-powered cryptocurrency and macroeconomic data analysis system.
+ 
+You receive the output of a Prophet forecast (or equivalent model) and must produce:
+- Concise, calibrated insights about the projected trajectory.
+- Actionable recommendations grounded in the forecast diagnostics.
+ 
+## Strict rules — follow all of them
+ 
+1. **Always mention the horizon explicitly** in at least one insight, expressed in days
+   (e.g., "over the next 30 days"). Use `metadata.horizon_days`.
+ 
+2. **Qualify uncertainty** based on `diagnostics.mean_ci_width_pct`:
+   - below 10%  → "low uncertainty"
+   - 10%–25%   → "moderate uncertainty"
+   - above 25% → "high uncertainty"
+   Cite this metric in `supporting_stats` whenever you qualify uncertainty.
+ 
+3. **Comment the projected dynamic vs recent history**:
+   - Use `diagnostics.trend_direction` and `diagnostics.forecast_vs_history_change_pct`
+     to describe whether the forecast continues, accelerates, or reverses the
+     recent trend.
+   - If `forecast_vs_history_change_pct` is between -1% and +1%, describe the
+     forecast as "essentially flat" relative to the last observed value.
+ 
+4. **Mention seasonality only if detected**:
+   - Check `diagnostics.seasonality_detected.weekly` and `.yearly`.
+   - Never invent seasonality that isn't reported.
+ 
+5. **No invented numbers**. Every number you cite must come directly from
+   `metadata`, `diagnostics`, or the forecast/historical arrays. Round
+   appropriately for readability (2–4 decimals).
+ 
+6. **Warnings matter**. If `warnings` is non-empty (short series, gaps,
+   dropped points), explicitly mention the reduced reliability in at least
+   one insight or recommendation.
+ 
+7. **JSON only**. No prose outside the schema. No markdown fences.
+ 
+8. **Recommendations must be actionable**: levels to watch, dates to monitor
+   (especially the forecast horizon end), or analyses to refine the prediction.
+   Never recommend buying / selling — stay analytical, not prescriptive.
+ 
+9. **`supporting_stats` must cite real paths** from the structure you were
+   given (e.g., `"diagnostics.trend_direction"`, `"metadata.horizon_days"`).
+   Do not invent paths.
+ 
+10. **Confidence scoring** in each insight reflects the data quality:
+    high (>0.8) only if `metadata.n_historical >= 60` AND warnings is empty
+    AND `mean_ci_width_pct` < 25%. Otherwise stay between 0.4 and 0.75.
+ 
+11. **Language**: write insights and recommendations in **French**, since
+    the end-user interface is French. Keep technical terms in their usual form.
+"""
+ 
+ 
+# ─── User prompt builder ────────────────────────────────────────────────────
+ 
+ 
+def _build_forecasting_user(
+    *,
+    stats: dict[str, Any],
+    series_label: str | None = None,
+    question: str | None = None,
+    **_unused: Any,
+) -> str:
+    """
+    Construit la partie "user" du prompt à partir du `ForecastResult.to_dict()`.
+ 
+    Parameters
+    ----------
+    stats : sortie de `ForecastResult.to_dict()`.
+    series_label : libellé humain de la série forecastée (ex: "BTC close_usd").
+                   Si None, on déduit depuis metadata.value_col.
+    question : question utilisateur d'origine, injectée pour contextualiser.
+    """
+    metadata = stats.get("metadata", {}) or {}
+    diagnostics = stats.get("diagnostics", {}) or {}
+    warnings = stats.get("warnings", []) or []
+    historical = stats.get("historical", []) or []
+    forecast = stats.get("forecast", []) or []
+ 
+    label = series_label or metadata.get("value_col") or "the series"
+    model = stats.get("model", "prophet")
+ 
+    # Échantillons clés du forecast pour ancrer le LLM
+    first_pt = forecast[0] if forecast else None
+    last_pt = forecast[-1] if forecast else None
+ 
+    sections: list[str] = []
+ 
+    sections.append(f"## Forecast target\n- Series: **{label}**\n- Model: {model}")
+ 
+    if question:
+        sections.append(f"## User question\n{question.strip()}")
+ 
+    sections.append(
+        "## Metadata\n"
+        f"- n_historical: {metadata.get('n_historical', '—')}\n"
+        f"- horizon_days: {metadata.get('horizon_days', '—')}\n"
+        f"- last_date: {metadata.get('last_date', '—')}\n"
+        f"- first_forecast_date: {metadata.get('first_forecast_date', '—')}\n"
+        f"- last_forecast_date: {metadata.get('last_forecast_date', '—')}"
+    )
+ 
+    # Diagnostics formatés
+    seas = diagnostics.get("seasonality_detected", {}) or {}
+    diag_lines = [
+        "## Diagnostics",
+        f"- trend_direction: {diagnostics.get('trend_direction', '—')}",
+        f"- trend_slope_pct: {_fmt(diagnostics.get('trend_slope_pct'))}",
+        f"- mean_ci_width_pct: {_fmt(diagnostics.get('mean_ci_width_pct'))}",
+        f"- forecast_vs_history_change_pct: "
+        f"{_fmt(diagnostics.get('forecast_vs_history_change_pct'))}",
+        f"- seasonality_detected.weekly: {seas.get('weekly', False)}",
+        f"- seasonality_detected.yearly: {seas.get('yearly', False)}",
+        f"- last_historical_value: {_fmt(diagnostics.get('last_historical_value'))}",
+        f"- first_forecast_value: {_fmt(diagnostics.get('first_forecast_value'))}",
+        f"- last_forecast_value: {_fmt(diagnostics.get('last_forecast_value'))}",
+    ]
+    sections.append("\n".join(diag_lines))
+ 
+    # Échantillons forecast (premier et dernier point avec leur IC)
+    if first_pt and last_pt:
+        sections.append(
+            "## Forecast endpoints\n"
+            f"- First: date={first_pt['date']}, yhat={_fmt(first_pt['yhat'])}, "
+            f"CI=[{_fmt(first_pt['yhat_lower'])}, {_fmt(first_pt['yhat_upper'])}]\n"
+            f"- Last:  date={last_pt['date']}, yhat={_fmt(last_pt['yhat'])}, "
+            f"CI=[{_fmt(last_pt['yhat_lower'])}, {_fmt(last_pt['yhat_upper'])}]"
+        )
+ 
+    # Dernier point historique (référence)
+    if historical:
+        last_hist = historical[-1]
+        sections.append(
+            "## Last historical point\n"
+            f"- date={last_hist['date']}, value={_fmt(last_hist['value'])}"
+        )
+ 
+    # Warnings
+    if warnings:
+        wlines = "\n".join(f"  - {w}" for w in warnings)
+        sections.append(f"## Warnings\n{wlines}")
+    else:
+        sections.append("## Warnings\n(none)")
+ 
+    sections.append(
+        "## Instruction\n"
+        "Produce the JSON output respecting the schema and all the rules in "
+        "the system prompt. Insights and recommendations must be in French."
+    )
+ 
+    return "\n\n".join(sections)
+ 
+ 
+def _fmt(x: Any) -> str:
+    """Format compact pour le prompt."""
+    if x is None:
+        return "—"
+    try:
+        return f"{float(x):.4f}"
+    except (TypeError, ValueError):
+        return str(x)
+ 
+ 
+# ─── Enregistrement ─────────────────────────────────────────────────────────
+ 
+ 
+register_prompt(
+    PromptTemplate(
+        task_name="forecasting",
+        system=_FORECASTING_SYSTEM,
+        build_user=_build_forecasting_user,
+    )
+)
+ 

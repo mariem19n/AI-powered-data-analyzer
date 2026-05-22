@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib import response
 
+from app.agents.analysis import stats
 from app.orchestrator.schemas import (
     AgentType,
     ClarificationRequest,
@@ -181,3 +183,28 @@ class ResponseAggregator:
         for warning in data.get("warnings", []):
             if warning:
                 response.warnings.append(f"[{step_id}] {str(warning)}")
+
+        stats = data.get("stats")
+        if stats:
+          response.analysis_stats[step_id] = stats
+
+        # Nouveau : récupérer les métadonnées external_summary
+        metadata = data.get("metadata") or {}
+
+        if metadata.get("task") == "external_summary":
+            sources = metadata.get("sources") or []
+
+            response.response_mode = "external"
+
+            response.external_data = {
+                "provider": metadata.get("provider", "tavily"),
+                "query": metadata.get("tavily_query"),
+                "sources": sources,
+                "method": metadata.get("method", "tavily_extract"),
+            }
+
+            # Si ton OrchestratorResponse contient provenance
+            if getattr(response, "provenance", None) is not None:
+                response.provenance.response_mode = "external"
+                response.provenance.external_sources = sources
+                response.provenance.summary = "Sources externes · Synthèse IA"

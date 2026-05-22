@@ -19,6 +19,9 @@ from app.agents.analysis.tasks import descriptive  # noqa: F401
 from app.agents.analysis.tasks import external_summary  # noqa: F401
 from app.agents.analysis.tasks import hybrid_summary  # noqa: F401
 from app.agents.analysis.tasks import anomaly_detection  # noqa: F401  
+from app.agents.analysis.tasks import correlation  # noqa: F401
+from app.agents.analysis.tasks import forecasting 
+
 
 # API publique du sous-package.
 from app.agents.analysis.tasks.base import (

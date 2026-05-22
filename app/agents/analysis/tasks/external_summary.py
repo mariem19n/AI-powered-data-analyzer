@@ -139,6 +139,7 @@ class ExternalSummaryTask(AnalysisTask):
         df: pd.DataFrame,
         instruction: dict[str, Any],
         semantic_context: dict[str, Any] | None = None,
+        **_unused: Any,
     ) -> TaskResult:
         start_time = time.perf_counter()
         warnings: list[str] = []

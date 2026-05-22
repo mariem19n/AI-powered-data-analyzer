@@ -702,7 +702,33 @@ class PlanGenerator:
     # ─── FORECASTING ──────────────────────────────────────────
 
     @staticmethod
+    def _extract_horizon_days(ctx: dict[str, Any], default: int = 30) -> int:
+        """
+        Extrait l'horizon de prévision depuis les time_filters du SemanticContext.
+
+        Cherche un pattern numérique dans raw_text :
+          "7 prochains jours" → 7
+          "next 14 days"      → 14
+          "30 jours"          → 30
+
+        Si aucun match → retourne `default`.
+        """
+        import re
+
+        for tf in ctx.get("time_filters", []):
+            raw = tf.get("raw_text", "")
+            m = re.search(
+                r"(\d+)\s*(?:prochains?\s*jours?|next\s*days?|jours?)",
+                raw,
+                re.IGNORECASE,
+            )
+            if m:
+                return int(m.group(1))
+        return default
+
+    @staticmethod
     def _forecasting_steps(ctx: dict[str, Any]) -> list[ExecutionStep]:
+        horizon = PlanGenerator._extract_horizon_days(ctx)
         return [
             ExecutionStep(
                 step_id="sql_1",
@@ -721,6 +747,7 @@ class PlanGenerator:
                 instruction={
                     "task": "forecasting",
                     "input_steps": ["sql_1"],
+                    "horizon_days": horizon,
                 },
                 depends_on=["sql_1"],
             ),

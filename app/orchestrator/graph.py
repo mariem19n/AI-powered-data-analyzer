@@ -51,7 +51,15 @@ from app.orchestrator.external_tool import (
     ExternalResult,
     TavilyExternalTool,
 )
+
+from app.orchestrator.conversation_context import (
+    ConversationContextResolver,
+    extract_turn_metadata,
+)
+ 
 from app.orchestrator.state import OrchestratorState, make_initial_state
+from app.orchestrator.provenance import build_provenance
+
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +120,7 @@ class Orchestrator:
         agents: dict[AgentType, AgentRunner],
         semantic_build_fn: SemanticBuildFn,
         external_tool: Any | None = None,
+        context_resolver: ConversationContextResolver | None = None,
         cache_check_fn: CacheCheckFn | None = None,
         cache_store_fn: CacheStoreFn | None = None,
         kg_plan_lookup_fn: KGPlanLookupFn | None = None,
@@ -129,6 +138,7 @@ class Orchestrator:
 
         self._semantic_build_fn = semantic_build_fn
         self._external_tool = external_tool
+        self._context_resolver = context_resolver
         self._cache_check_fn = cache_check_fn
         self._cache_store_fn = cache_store_fn
         self._kg_plan_lookup_fn = kg_plan_lookup_fn
@@ -194,6 +204,36 @@ class Orchestrator:
         state["normalized_question"] = normalized
         state["question_hash"] = q_hash
         logger.info("Q[%s] normalized : '%s'", q_hash, normalized[:80])
+        return state
+
+    async def _context_resolve_node(
+        self, state: OrchestratorState
+    ) -> OrchestratorState:
+        """
+        Nœud 1.5 — Résolution du contexte conversationnel.
+ 
+        Inséré entre normalize et cache_check.
+        Détecte les follow-ups et réécrit la question si nécessaire
+        AVANT le cache check — sinon le hash serait calculé sur
+        une question incomplète comme "Et pour Ethereum ?".
+ 
+        Si pas de context_resolver configuré, passe directement.
+        """
+        if self._context_resolver is None:
+            state["is_follow_up"] = False
+            return state
+ 
+        try:
+            state = await self._context_resolver.resolve(state)
+        except Exception as e:
+            logger.warning(
+                "ConversationContextResolver error (non-bloquant) : %s", e
+            )
+            state["is_follow_up"] = False
+            state.setdefault("warnings", []).append(
+                f"Context resolution failed: {e}"
+            )
+ 
         return state
 
     async def _cache_check_node(
@@ -700,7 +740,24 @@ class Orchestrator:
             except Exception as e:
                 logger.warning("KG plan store failed : %s", e)
                 state.setdefault("warnings", []).append(f"kg_plan_store: {e}")
-
+        
+        # ── Sauvegarder le tour conversationnel ──────────────
+        if self._context_resolver is not None:
+            try:
+                metadata = extract_turn_metadata(
+                    state.get("intent"),
+                    state.get("semantic_context"),
+                )
+                await self._context_resolver.save_turn(
+                    session_id=state.get("session_id", ""),
+                    original_question=state.get("raw_question", ""),
+                    resolved_question=state.get("normalized_question", ""),
+                    **metadata,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Échec sauvegarde tour conversationnel (non-bloquant) : %s", e
+                )
         return state
 
     # ═════════════════════════════════════════════════════════
@@ -760,6 +817,7 @@ class Orchestrator:
         g = StateGraph(OrchestratorState)
 
         g.add_node("normalize", self._normalize_node)
+        g.add_node("context_resolve", self._context_resolve_node)
         g.add_node("cache_check", self._cache_check_node)
         g.add_node("intent", self._intent_node)
         g.add_node("semantic", self._semantic_node)
@@ -771,7 +829,8 @@ class Orchestrator:
         g.add_node("cache_store", self._cache_store_node)
 
         g.set_entry_point("normalize")
-        g.add_edge("normalize", "cache_check")
+        g.add_edge("normalize", "context_resolve") 
+        g.add_edge("context_resolve", "cache_check")
 
         # cache_check : hit → END, miss → intent
         g.add_conditional_edges(
@@ -825,6 +884,7 @@ class Orchestrator:
     ) -> OrchestratorState:
         """Exécution séquentielle si langgraph n'est pas installé."""
         state = await self._normalize_node(state)
+        state = await self._context_resolve_node(state) 
         state = await self._cache_check_node(state)
 
         if state.get("cache_hit"):
@@ -958,6 +1018,9 @@ class Orchestrator:
         )
         response.llm_trace = llm_trace
 
+        # The aggregator may detect "external" mode from ExternalSummaryTask metadata.
+        agg_is_external = response.response_mode in ("external", ResponseMode.EXTERNAL)
+
         if response_mode == "hybrid":
             ext = state.get("external_result")
             response.response_mode = ResponseMode.HYBRID
@@ -968,9 +1031,18 @@ class Orchestrator:
                 "Les sections marquées 'source externe' n'ont pas été "
                 "vérifiées par le système."
             )
-        else:
+        elif not agg_is_external:
             response.response_mode = ResponseMode.INTERNAL
 
+        effective_mode = "external" if agg_is_external else response_mode
+        response.provenance = build_provenance(
+            response_mode=effective_mode,
+            intent=state.get("intent"),
+            plan=state.get("plan"),
+            step_results=state.get("step_results", {}),
+            external_data=state.get("external_result"),
+            analysis_stats=getattr(response, "analysis_stats", None),
+        )
         return response
 
 

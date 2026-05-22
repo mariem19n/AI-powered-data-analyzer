@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -132,6 +133,16 @@ class TavilyExternalTool:
             "messari.io",
             "glassnode.com",
         ],
+        "crypto_education": [
+            "investopedia.com",
+            "alternative.me",
+            "academy.binance.com",
+            "coindesk.com",
+            "cointelegraph.com",
+            "kraken.com",
+            "gemini.com",
+            "coingecko.com",
+        ],
         "crypto_sentiment": [
             "alternative.me",
             "coinglass.com",
@@ -182,12 +193,72 @@ class TavilyExternalTool:
     def is_configured(self) -> bool:
         return bool(self._api_key)
 
-    def _detect_topic(self, query: str) -> str:
+    # Keywords indicating the user wants a definition/explanation, not news
+    _EXPLAIN_KEYWORDS = (
+        "explique", "expliquer", "c'est quoi", "qu'est-ce", "définition",
+        "definition", "explain", "what is", "c est quoi", "comment fonctionne",
+        "how does", "how do", "kesako", "kézako",
+    )
+
+    @staticmethod
+    def is_explanatory_query(query: str) -> bool:
+        q = query.lower()
+        return any(kw in q for kw in TavilyExternalTool._EXPLAIN_KEYWORDS)
+
+    @staticmethod
+    def reformulate_for_search(query: str) -> str:
+        """
+        Rewrites a French/mixed definitional query into a clean English search
+        query suitable for Tavily.
+
+        Examples:
+          "explique fear and greed"  → "crypto fear and greed index definition explained"
+          "c'est quoi le RSI"        → "RSI indicator definition explained crypto"
+          "what is DeFi"             → "what is DeFi definition explained"
+        """
+        q = query.strip()
+
+        # Strip French explanation prefixes
+        prefixes = (
+            r"^expliqu[ée](?:z|r)?\s+(?:moi\s+)?(?:le\s+|la\s+|les\s+|l['']\s*)?",
+            r"^c['']est quoi\s+(?:le\s+|la\s+|les\s+|l['']\s*)?",
+            r"^qu['']est[-\s]ce que\s+(?:le\s+|la\s+|les\s+|l['']\s*)?",
+            r"^c est quoi\s+(?:le\s+|la\s+|les\s+|l['']\s*)?",
+            r"^(?:la\s+)?définition\s+(?:de\s+(?:le\s+|la\s+|l['']\s*)?)?",
+            r"^comment fonctionne\s+(?:le\s+|la\s+|les\s+|l['']\s*)?",
+            r"^what is\s+(?:the\s+)?",
+            r"^how does\s+(?:the\s+)?",
+            r"^how do\s+(?:the\s+)?",
+        )
+        core = q
+        for pat in prefixes:
+            core = re.sub(pat, "", core, flags=re.IGNORECASE).strip()
+            if core != q.strip():
+                break  # only strip once
+
+        # If nothing was stripped, keep original
+        if not core or len(core) < 2:
+            core = q
+
+        # Build a clean English definitional query
+        if not any(kw in core.lower() for kw in ("definition", "explained", "what is")):
+            return f"{core} definition explained"
+        return core
+
+    def _detect_topic(self, query: str, explanatory: bool = False) -> str:
         """
         Détecte le topic de la question pour choisir la bonne whitelist.
         Logique simple par mots-clés — pas d'appel LLM.
         """
         q = query.lower()
+
+        # Definitional queries → educational domains first
+        if explanatory:
+            if any(w in q for w in ["sentiment", "fear", "greed", "peur",
+                                     "rsi", "macd", "indicator", "index",
+                                     "defi", "blockchain", "staking", "yield",
+                                     "crypto"]):
+                return "crypto_education"
 
         if any(w in q for w in ["sentiment", "fear", "greed", "peur"]):
             return "crypto_sentiment"
@@ -217,8 +288,20 @@ class TavilyExternalTool:
 
         import httpx
 
+        # Detect if this is a definitional/explanatory query and rewrite it
+        explanatory = self.is_explanatory_query(query)
+        if explanatory:
+            search_query = self.reformulate_for_search(query)
+            logger.info(
+                "Explanatory query detected — reformulated: %r → %r",
+                query,
+                search_query,
+            )
+        else:
+            search_query = query
+
         # Détection du topic pour la whitelist
-        resolved_topic = topic or self._detect_topic(query)
+        resolved_topic = topic or self._detect_topic(query, explanatory=explanatory)
         include_domains = self.TRUSTED_DOMAINS.get(
             resolved_topic,
             self.TRUSTED_DOMAINS["general"],
@@ -231,7 +314,7 @@ class TavilyExternalTool:
         )
 
         search_results = await self._tavily_search(
-            query, httpx, include_domains
+            search_query, httpx, include_domains
         )
         if not search_results.sources:
             return search_results
@@ -278,7 +361,7 @@ class TavilyExternalTool:
                 response.raise_for_status()
                 data = response.json()
 
-            sources = [
+            raw_sources = [
                 ExternalSource(
                     title=r.get("title", ""),
                     url=r.get("url", ""),
@@ -287,6 +370,8 @@ class TavilyExternalTool:
                 )
                 for r in data.get("results", [])
             ]
+            # Drop low-relevance results (score < 0.3) to avoid unrelated pages
+            sources = [s for s in raw_sources if s.score >= 0.3] or raw_sources
 
             return ExternalResult(
                 query=query,

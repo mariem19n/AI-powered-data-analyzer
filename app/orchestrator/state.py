@@ -33,6 +33,11 @@ class OrchestratorState(TypedDict, total=False):
     question_hash: str  # SHA-256 de la question normalisée
     user_context: dict[str, Any]  # role, preferences, etc.
 
+    # ── Contexte conversationnel ────────────────────────────
+    is_follow_up: bool
+    follow_up_detection: dict[str, Any] | None  # FollowUpDetection.model_dump()
+    conversation_context: dict[str, Any] | None  # ConversationState.model_dump()
+
     # ── Cache Redis (niveau question) ────────────────────────
     cache_hit: bool
     cached_response: dict[str, Any] | None
@@ -88,6 +93,9 @@ def make_initial_state(
         normalized_question="",
         question_hash="",
         user_context=user_context or {},
+        is_follow_up=False,
+        follow_up_detection=None,
+        conversation_context=None,
         cache_hit=False,
         cached_response=None,
         intent=None,

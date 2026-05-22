@@ -15,6 +15,8 @@ from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+from app.orchestrator.provenance import ProvenanceTrace
+
 
 
 # ─── Énumérations ─────────────────────────────────────────────
@@ -259,6 +261,11 @@ class OrchestratorResponse(BaseModel):
         description="Recommandations actionnables",
     )
 
+    analysis_stats: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Stats brutes par step_id (forecast evaluation, diagnostics, etc.)",
+    )
+
     # Statut
     needs_clarification: bool = False
     clarification: ClarificationRequest | None = None
@@ -298,6 +305,11 @@ class OrchestratorResponse(BaseModel):
             "Message affiché à l'utilisateur quand la réponse contient "
             "des données externes. Vide pour les réponses 100% internes."
         ),
+    )
+
+    provenance: ProvenanceTrace | None = Field(
+        default=None,
+        description="Trace de provenance pour le modal 'Sources et méthode'",
     )
 
     # Méta

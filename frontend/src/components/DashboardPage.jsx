@@ -4,6 +4,7 @@ import TopBar from "./TopBar.jsx";
 import UserBubble from "./UserBubble.jsx";
 import AssistantBubble from "./AssistantBubble.jsx";
 import InputBar from "./InputBar.jsx";
+import CryptoMarketCards from "./CryptoMarketCards.jsx";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 const REQUEST_TIMEOUT_MS = 45000;
@@ -133,6 +134,8 @@ export default function DashboardPage() {
         <TopBar onToggleSidebar={() => setSidebarOpen((v) => !v)} />
 
         <div className="chat-scroll">
+          <CryptoMarketCards />
+
           {messages.length === 0 && !isLoading && (
             <div className="chat-empty">
               <div className="chat-empty-icon" aria-hidden="true">✦</div>
