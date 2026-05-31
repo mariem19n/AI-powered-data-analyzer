@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import Sidebar from "./Sidebar.jsx";
+import { useCallback, useEffect, useRef, useState } from "react";
+import ConversationSidebar from "./ConversationSidebar.jsx";
 import TopBar from "./TopBar.jsx";
 import UserBubble from "./UserBubble.jsx";
 import AssistantBubble from "./AssistantBubble.jsx";
@@ -39,7 +39,10 @@ function getErrorMessage(error, status) {
 
 export default function DashboardPage() {
   const [messages, setMessages] = useState([]);
+  const [conversations, setConversations] = useState([]);
+  const [activeConversationId, setActiveConversationId] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isConversationLoading, setIsConversationLoading] = useState(false);
   const [apiStatus, setApiStatus] = useState("checking");
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -54,9 +57,120 @@ export default function DashboardPage() {
     return () => controller.abort();
   }, []);
 
+  const refreshConversations = useCallback(async () => {
+    setIsConversationLoading(true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/conversations`);
+      if (!response.ok) throw new Error("Failed to load conversations");
+      const payload = await response.json();
+      setConversations(Array.isArray(payload) ? payload : []);
+      setApiStatus("online");
+    } catch {
+      setApiStatus("offline");
+    } finally {
+      setIsConversationLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshConversations();
+  }, [refreshConversations]);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isLoading]);
+
+  function mapStoredMessages(storedMessages) {
+    let lastUserQuestion = "";
+    return storedMessages.map((message) => {
+      if (message.role === "user") {
+        lastUserQuestion = message.content;
+        return { role: "user", content: message.content, messageId: message.id };
+      }
+
+      if (message.response_json) {
+        return {
+          role: "assistant",
+          messageId: message.id,
+          conversationId: message.conversation_id,
+          response: message.response_json,
+          originalQuestion: message.response_json?.question || lastUserQuestion,
+        };
+      }
+
+      return {
+        role: "assistant",
+        messageId: message.id,
+        conversationId: message.conversation_id,
+        response: { insights: [message.content], data: [], visualizations: [] },
+        originalQuestion: lastUserQuestion,
+      };
+    });
+  }
+
+  function getPreviousUserQuestion(index) {
+    for (let i = index - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === "user" && messages[i]?.content) {
+        return messages[i].content;
+      }
+    }
+    return "";
+  }
+
+  async function handleSelectConversation(conversationId) {
+    if (isLoading) return;
+
+    setIsConversationLoading(true);
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/conversations/${conversationId}/messages`
+      );
+      if (!response.ok) throw new Error("Failed to load conversation");
+      const payload = await response.json();
+      setMessages(mapStoredMessages(Array.isArray(payload) ? payload : []));
+      setActiveConversationId(conversationId);
+      setSidebarOpen(false);
+      setApiStatus("online");
+    } catch {
+      setApiStatus("degraded");
+    } finally {
+      setIsConversationLoading(false);
+    }
+  }
+
+  async function handleDeleteConversation(conversationId) {
+    if (!window.confirm("Supprimer cette conversation ?")) return;
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/conversations/${conversationId}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) throw new Error("Failed to delete conversation");
+      if (conversationId === activeConversationId) {
+        handleNewConversation();
+      }
+      await refreshConversations();
+    } catch {
+      setApiStatus("degraded");
+    }
+  }
+
+  async function handleRenameConversation(conversation) {
+    const title = window.prompt("Nouveau titre", conversation.title);
+    if (!title || title.trim() === conversation.title) return;
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/conversations/${conversation.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: title.trim() }),
+      });
+      if (!response.ok) throw new Error("Failed to rename conversation");
+      await refreshConversations();
+    } catch {
+      setApiStatus("degraded");
+    }
+  }
 
   async function handleSubmit(question) {
     const text = question.trim();
@@ -74,7 +188,11 @@ export default function DashboardPage() {
       const response = await fetch(`${API_BASE_URL}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: text, session_id: sessionId.current }),
+        body: JSON.stringify({
+          question: text,
+          session_id: sessionId.current,
+          conversation_id: activeConversationId,
+        }),
         signal: controller.signal,
       });
       status = response.status;
@@ -95,7 +213,20 @@ export default function DashboardPage() {
       }
 
       setApiStatus("online");
-      setMessages((prev) => [...prev, { role: "assistant", response: payload }]);
+      if (payload?.conversation_id) {
+        setActiveConversationId(payload.conversation_id);
+      }
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          messageId: payload?.message_id,
+          conversationId: payload?.conversation_id,
+          response: payload,
+          originalQuestion: text,
+        },
+      ]);
+      await refreshConversations();
     } catch (requestError) {
       setApiStatus(status != null ? "degraded" : "offline");
       setMessages((prev) => [
@@ -114,6 +245,7 @@ export default function DashboardPage() {
 
   function handleNewConversation() {
     setMessages([]);
+    setActiveConversationId(null);
     const newId = crypto.randomUUID();
     sessionId.current = newId;
     localStorage.setItem("session_id", newId);
@@ -122,12 +254,18 @@ export default function DashboardPage() {
 
   return (
     <div className="app-shell">
-      <Sidebar
+      <ConversationSidebar
         apiStatus={apiStatus}
         apiBase={API_BASE_URL}
+        conversations={conversations}
+        activeConversationId={activeConversationId}
         isOpen={sidebarOpen}
+        isLoading={isConversationLoading}
         onClose={() => setSidebarOpen(false)}
+        onDeleteConversation={handleDeleteConversation}
         onNewConversation={handleNewConversation}
+        onRenameConversation={handleRenameConversation}
+        onSelectConversation={handleSelectConversation}
       />
 
       <div className="main-area">
@@ -146,7 +284,12 @@ export default function DashboardPage() {
 
           {messages.map((msg, i) =>
             msg.role === "user" ? (
-              <UserBubble key={i} content={msg.content} />
+              <UserBubble
+                key={i}
+                content={msg.content}
+                isLoading={isLoading}
+                onRerun={handleSubmit}
+              />
             ) : (
               <AssistantBubble
                 key={i}
@@ -154,6 +297,13 @@ export default function DashboardPage() {
                 isError={msg.isError}
                 errorMessage={msg.errorMessage}
                 onSubmit={handleSubmit}
+                conversationId={msg.conversationId || activeConversationId}
+                messageId={msg.messageId || msg.response?.message_id}
+                originalQuestion={
+                  msg.originalQuestion ||
+                  msg.response?.question ||
+                  getPreviousUserQuestion(i)
+                }
               />
             )
           )}

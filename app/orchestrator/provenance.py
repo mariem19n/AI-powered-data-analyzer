@@ -702,7 +702,7 @@ def _normalize_task(task: str | None) -> str:
         "comparison": "comparison",
         "multi_dim_comparison": "comparison",
         "descriptive": "descriptive",
-        "aggregation": "descriptive",
+        "aggregation": "aggregation",
         "diagnostic_report": "diagnosis",
         "causal_correlation": "diagnosis",
     }
@@ -774,6 +774,11 @@ _TABLE_LABELS: dict[str, str] = {
 
 
 _TASK_TO_METHOD: dict[str, tuple[str, str, str | None]] = {
+    "aggregation": (
+        "Agrégation SQL",
+        "Calcul d'une valeur agrégée demandée à partir des données filtrées.",
+        "SQL aggregate",
+    ),
     "descriptive": (
         "Analyse descriptive",
         "Calcul des indicateurs clés et synthèse des tendances observées.",

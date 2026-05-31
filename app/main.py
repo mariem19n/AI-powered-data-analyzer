@@ -11,21 +11,36 @@ import logging
 from datetime import date, datetime
 from decimal import Decimal
 from contextlib import asynccontextmanager
+from uuid import UUID
 
 import psycopg2
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.db.conversations import (
+    add_message,
+    create_conversation,
+    delete_conversation,
+    get_conversation,
+    init_conversation_tables,
+    list_conversations,
+    list_messages,
+    make_conversation_title,
+    rename_conversation,
+)
+from app.db.feedback import init_feedback_tables
 from app.health import check_all_services
 from app.orchestrator.conversation_context import ConversationContextResolver
 
 from app.api.routes.feedback import router as feedback_router
+from app.api.routes.expert import router as expert_router
 
 logger = logging.getLogger(__name__)
 
 MAIN_CRYPTO_SYMBOLS = ("BTC", "ETH", "BNB", "XRP", "ADA", "SOL", "DOT", "DOGE", "AVAX", "LINK")
+CURRENT_USER_ID = None
 
 
 def _to_json_value(value):
@@ -35,6 +50,34 @@ def _to_json_value(value):
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     return value
+
+
+def _assistant_content(response_json: dict) -> str:
+    """Pick a readable message body while preserving the full JSON separately."""
+    insights = response_json.get("insights")
+    if isinstance(insights, list):
+        text = "\n".join(str(item).strip() for item in insights if str(item).strip())
+        if text:
+            return text
+
+    recommendations = response_json.get("recommendations")
+    if isinstance(recommendations, list):
+        text = "\n".join(str(item).strip() for item in recommendations if str(item).strip())
+        if text:
+            return text
+
+    clarification = response_json.get("clarification") or {}
+    if response_json.get("needs_clarification") and isinstance(clarification, dict):
+        suggestions = clarification.get("suggestions") or []
+        reason = clarification.get("reason") or "Clarification needed."
+        if suggestions:
+            return f"{reason}\n" + "\n".join(str(item) for item in suggestions)
+        return str(reason)
+
+    if response_json.get("source_disclaimer"):
+        return str(response_json["source_disclaimer"])
+
+    return "Analysis complete."
 
 
 # ─── Helpers de démarrage résilient ──────────────────────────
@@ -90,6 +133,8 @@ async def lifespan(app: FastAPI):
 
     # ── 1. Connexion aux services (avec retry) ────────────────
     await _wait_for("PostgreSQL", pg_pool.connect, is_async=True)
+    await init_conversation_tables(pg_pool.pool)
+    await init_feedback_tables(pg_pool.pool)
     await _wait_for(
         "Neo4j", neo4j_driver.verify_connectivity, is_async=False
     )
@@ -255,6 +300,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(feedback_router)
+app.include_router(expert_router)
 
 
 # ─── Routes ───────────────────────────────────────────────────
@@ -347,6 +393,78 @@ async def neo4j_status():
 # ─── Route Orchestrator ──────────────────────────────────────
 
 
+@app.post("/conversations")
+async def create_conversation_endpoint(payload: dict | None = None):
+    """Create a persistent conversation shell."""
+    from app.db.postgres import pg_pool
+
+    payload = payload or {}
+    title = payload.get("title") or "Nouvelle conversation"
+    return await create_conversation(
+        pg_pool.pool,
+        user_id=CURRENT_USER_ID,
+        title=title,
+    )
+
+
+@app.get("/conversations")
+async def list_conversations_endpoint():
+    """List conversations for the current user, newest first."""
+    from app.db.postgres import pg_pool
+
+    return await list_conversations(pg_pool.pool, user_id=CURRENT_USER_ID)
+
+
+@app.get("/conversations/{conversation_id}/messages")
+async def list_conversation_messages_endpoint(conversation_id: UUID):
+    """Return messages for a conversation in chronological order."""
+    from app.db.postgres import pg_pool
+
+    messages = await list_messages(
+        pg_pool.pool,
+        conversation_id,
+        user_id=CURRENT_USER_ID,
+    )
+    if messages is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return messages
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation_endpoint(conversation_id: UUID):
+    """Delete a conversation and all of its messages."""
+    from app.db.postgres import pg_pool
+
+    deleted = await delete_conversation(
+        pg_pool.pool,
+        conversation_id,
+        user_id=CURRENT_USER_ID,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"deleted": True}
+
+
+@app.patch("/conversations/{conversation_id}")
+async def rename_conversation_endpoint(conversation_id: UUID, payload: dict):
+    """Rename a conversation."""
+    from app.db.postgres import pg_pool
+
+    title = str(payload.get("title", "")).strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+
+    conversation = await rename_conversation(
+        pg_pool.pool,
+        conversation_id,
+        title=title,
+        user_id=CURRENT_USER_ID,
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conversation
+
+
 @app.post("/ask")
 async def ask_question(payload: dict):
     """
@@ -355,13 +473,17 @@ async def ask_question(payload: dict):
     Body JSON :
         {
             "question": "prix Bitcoin ce mois",
-            "session_id": "optional-uuid"
+            "session_id": "optional-uuid",
+            "conversation_id": "optional-uuid"
         }
 
-    Retourne un OrchestratorResponse JSON.
+    Retourne un OrchestratorResponse JSON avec conversation_id.
     """
+    from app.db.postgres import pg_pool
+
     question = payload.get("question", "").strip()
     session_id = payload.get("session_id")
+    raw_conversation_id = payload.get("conversation_id")
 
     if not question:
         return JSONResponse(
@@ -369,9 +491,47 @@ async def ask_question(payload: dict):
             status_code=400,
         )
 
+    if raw_conversation_id:
+        try:
+            conversation_id = UUID(str(raw_conversation_id))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid conversation_id")
+
+        conversation = await get_conversation(
+            pg_pool.pool,
+            conversation_id,
+            user_id=CURRENT_USER_ID,
+        )
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+    else:
+        conversation = await create_conversation(
+            pg_pool.pool,
+            user_id=CURRENT_USER_ID,
+            title=make_conversation_title(question),
+        )
+        conversation_id = UUID(conversation["id"])
+
+    await add_message(
+        pg_pool.pool,
+        conversation_id=conversation_id,
+        role="user",
+        content=question,
+    )
+
     orchestrator = app.state.orchestrator
     response = await orchestrator.handle(
         question=question,
         session_id=session_id,
     )
-    return response.model_dump(mode="json")
+    response_json = response.model_dump(mode="json")
+    assistant_message = await add_message(
+        pg_pool.pool,
+        conversation_id=conversation_id,
+        role="assistant",
+        content=_assistant_content(response_json),
+        response_json=response_json,
+    )
+    response_json["conversation_id"] = str(conversation_id)
+    response_json["message_id"] = assistant_message["id"]
+    return response_json

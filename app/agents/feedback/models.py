@@ -1,13 +1,4 @@
-"""
-app/agents/feedback/models.py
-
-Modèles Pydantic du Feedback Agent.
-
-FeedbackInput : ce que le frontend envoie.
-ImplicitSignals : signaux automatiques capturés par le pipeline.
-CompositeScore : résultat du calcul pondéré.
-FeedbackResult : réponse finale retournée au frontend.
-"""
+"""Pydantic schemas for the Feedback Agent pipeline."""
 
 from __future__ import annotations
 
@@ -18,21 +9,21 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 
-# ── Enums ──────────────────────────────────────────────────────────────────
-
-
 class FeedbackType(str, Enum):
-    """Type de feedback soumis par l'utilisateur."""
+    """Type of feedback submitted by the user."""
 
-    RATING = "rating"                      # note 1–5
-    CORRECTION_SQL = "correction_sql"      # correction manuelle du SQL
-    CORRECTION_INSIGHT = "correction_insight"  # reformulation d'un insight
-    FALSE_POSITIVE = "false_positive"      # anomalie signalée comme fausse
-    USELESS = "useless"                    # réponse jugée inutile
+    RATING = "rating"
+    POSITIVE = "positive"
+    NEGATIVE = "negative"
+    COMMENT = "comment"
+    CORRECTION_SQL = "correction_sql"
+    CORRECTION_INSIGHT = "correction_insight"
+    FALSE_POSITIVE = "false_positive"
+    USELESS = "useless"
 
 
 class TargetType(str, Enum):
-    """Sur quoi porte le feedback."""
+    """Object type targeted by the feedback."""
 
     ANSWER = "answer"
     INSIGHT = "insight"
@@ -43,178 +34,145 @@ class TargetType(str, Enum):
 
 
 class FeedbackStatus(str, Enum):
-    """Statut assigné après le calcul du score composite."""
+    """Status derived from the legacy composite score."""
 
     REINFORCED = "reinforced"
     DEPRECATED = "deprecated"
     NEUTRAL = "neutral"
 
 
-# ── Input : ce que le frontend envoie ──────────────────────────────────────
+class FeedbackCategory(str, Enum):
+    """Deterministic category assigned to feedback text."""
+
+    POSITIVE_FEEDBACK = "positive_feedback"
+    OPINION_OR_EMOTION = "opinion_or_emotion"
+    TECHNICAL_ERROR = "technical_error"
+    SEMANTIC_ERROR = "semantic_error"
+    DATA_ERROR = "data_error"
+    VISUALIZATION_ERROR = "visualization_error"
+    SOURCE_ERROR = "source_error"
+    FORMATTING_OR_TONE = "formatting_or_tone"
+    VAGUE_NEGATIVE = "vague_negative"
+    CORRECTION_SUGGESTION = "correction_suggestion"
+    UNCLASSIFIED = "unclassified"
+
+
+class ValidationStatus(str, Enum):
+    """Context-aware validation status for feedback credibility."""
+
+    ACCEPTED = "accepted"
+    PENDING_REVIEW = "pending_review"
+    LOW_CONFIDENCE = "low_confidence"
+    REJECTED = "rejected"
 
 
 class FeedbackInput(BaseModel):
-    """Payload d'un feedback utilisateur via POST /api/feedback."""
+    """Payload normalized for the Feedback Agent."""
 
-    # Identifiants de contexte
-    response_id: str = Field(
-        ..., description="ID unique de la réponse évaluée."
-    )
-    session_id: str = Field(
-        ..., description="ID de la session conversationnelle."
-    )
-
-    # Question originale
-    question: str = Field(
-        ..., description="Question posée par l'utilisateur."
-    )
-    resolved_question: str | None = Field(
-        default=None,
-        description="Question après résolution sémantique (si disponible).",
-    )
-
-    # Contexte d'exécution
-    intent: str | None = Field(
-        default=None,
-        description="Intent détecté par l'Orchestrateur.",
-    )
-
-    # Feedback explicite
-    rating: int = Field(
-        ..., ge=1, le=5,
-        description="Note de 1 à 5 donnée par l'utilisateur.",
-    )
-    comment: str | None = Field(
-        default=None,
-        description="Commentaire libre optionnel.",
-    )
-    feedback_type: FeedbackType = Field(
-        default=FeedbackType.RATING,
-        description="Type de feedback.",
-    )
-
-    # Cible précise
-    target_type: TargetType = Field(
-        default=TargetType.ANSWER,
-        description="Type d'objet évalué.",
-    )
-    target_id: str | None = Field(
-        default=None,
-        description="ID du nœud KG cible (Insight, SQLQuery, Anomaly…).",
-    )
-
-    # Corrections manuelles
-    corrected_sql: str | None = Field(
-        default=None,
-        description="SQL corrigé manuellement par l'utilisateur.",
-    )
-    corrected_text: str | None = Field(
-        default=None,
-        description="Texte d'insight corrigé par l'utilisateur.",
-    )
+    response_id: str = Field(description="Unique ID of the evaluated response.")
+    session_id: str = Field(description="Conversation/session ID.")
+    question: str = Field(description="Original user question.")
+    resolved_question: str | None = Field(default=None)
+    intent: str | None = Field(default=None)
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None)
+    feedback_type: FeedbackType = Field(default=FeedbackType.RATING)
+    target_type: TargetType = Field(default=TargetType.ANSWER)
+    target_id: str | None = Field(default=None)
+    corrected_sql: str | None = Field(default=None)
+    corrected_text: str | None = Field(default=None)
 
     @field_validator("rating")
     @classmethod
-    def rating_in_range(cls, v: int) -> int:
-        if not 1 <= v <= 5:
-            raise ValueError("Le rating doit être entre 1 et 5.")
-        return v
-
-
-# ── Signaux implicites (collectés automatiquement) ─────────────────────────
+    def rating_in_range(cls, value: int) -> int:
+        """Validate the explicit user rating."""
+        if not 1 <= value <= 5:
+            raise ValueError("rating must be between 1 and 5")
+        return value
 
 
 class ImplicitSignals(BaseModel):
-    """Signaux d'exécution capturés par le pipeline.
+    """Implicit behavioral and execution signals captured around feedback."""
 
-    Ces signaux sont disponibles à 100% des requêtes, contrairement au
-    feedback humain explicite (~5-10% de taux de retour en production).
-    """
-
-    execution_success: bool = Field(
-        default=True,
-        description="Le pipeline s'est exécuté sans erreur.",
-    )
-    response_time_seconds: float | None = Field(
-        default=None,
-        description="Temps de réponse total en secondes.",
-    )
-    null_rate: float | None = Field(
-        default=None,
-        description="Taux de valeurs nulles dans le DataFrame résultat.",
-    )
-    llm_confidence: float | None = Field(
-        default=None,
-        description="Confiance retournée par le LLM (0.0–1.0).",
-    )
-    row_count: int | None = Field(
-        default=None,
-        description="Nombre de lignes dans le résultat.",
-    )
-    warnings_count: int = Field(
-        default=0,
-        description="Nombre de warnings non-bloquants émis.",
-    )
+    execution_success: bool = Field(default=True)
+    response_time_seconds: float | None = Field(default=None)
+    null_rate: float | None = Field(default=None)
+    llm_confidence: float | None = Field(default=None)
+    row_count: int | None = Field(default=None)
+    warnings_count: int = Field(default=0)
+    dwell_time_ms: int | None = Field(default=None)
+    response_char_count: int | None = Field(default=None)
+    copied_response: bool = Field(default=False)
+    copy_zone: str | None = Field(default=None)
+    opened_sources: bool = Field(default=False)
+    opened_details: bool = Field(default=False)
+    expanded_visualization: bool = Field(default=False)
+    exported_report: bool = Field(default=False)
+    reran_question: bool = Field(default=False)
+    follow_up_question: str | None = Field(default=None)
+    reformulation_similarity: float | None = Field(default=None, ge=0.0, le=1.0)
+    reformulation_detected: bool | None = Field(default=None)
+    warnings_visible: bool = Field(default=False)
+    response_had_visualization: bool = Field(default=False)
 
 
-# ── Score composite ────────────────────────────────────────────────────────
+class ClassificationResult(BaseModel):
+    """Output of the deterministic feedback text classifier."""
+
+    feedback_category: FeedbackCategory = Field(default=FeedbackCategory.UNCLASSIFIED)
+    category_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    extracted_claims: list[str] = Field(default_factory=list)
+    is_specific: bool = Field(default=False)
+    mentions_verifiable_element: bool = Field(default=False)
+
+
+class JudgeResult(BaseModel):
+    """Structured output of the optional LLM Judge."""
+
+    judge_verdict: str = Field(
+        description="supports_user_feedback | contradicts_user_feedback | inconclusive"
+    )
+    judge_confidence: float = Field(ge=0.0, le=1.0)
+    judge_reason: str
+    error_type: str
+
+
+class ValidationResult(BaseModel):
+    """Context-aware validation result for a feedback item."""
+
+    validation_status: ValidationStatus
+    credibility_score: float = Field(ge=0.0, le=1.0)
+    validation_reason: str
+    feedback_category: FeedbackCategory
+    category_confidence: float = Field(ge=0.0, le=1.0)
+    detected_signals: dict[str, Any] = Field(default_factory=dict)
+    needs_human_review: bool = Field(default=False)
+    judge_result: JudgeResult | None = Field(default=None)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class CompositeScore(BaseModel):
-    """Résultat du calcul du score composite pondéré.
+    """Legacy weighted score result on a 1-5 scale."""
 
-    Échelle : 1–5. Les pondérations sont redistribuées si une
-    composante est absente (ex: pas d'expert → humain 62.5%, implicite 37.5%).
-    """
-
-    score_human: float | None = Field(
-        default=None,
-        description="Score humain (1–5). None si pas de feedback explicite.",
-    )
-    score_implicit: float | None = Field(
-        default=None,
-        description="Score implicite (1–5). None si pas de signaux.",
-    )
-    score_expert: float | None = Field(
-        default=None,
-        description="Score expert (1–5). None si pas de validation.",
-    )
-
-    weight_human: float = Field(description="Pondération effective humain.")
-    weight_implicit: float = Field(description="Pondération effective implicite.")
-    weight_expert: float = Field(description="Pondération effective expert.")
-
-    composite: float = Field(
-        description="Score final composite (1–5).",
-    )
-    status: FeedbackStatus = Field(
-        description="Statut déduit du score : reinforced, deprecated, neutral.",
-    )
-
-
-# ── Résultat final ─────────────────────────────────────────────────────────
+    score_human: float | None = Field(default=None)
+    score_implicit: float | None = Field(default=None)
+    score_expert: float | None = Field(default=None)
+    weight_human: float
+    weight_implicit: float
+    weight_expert: float
+    composite: float
+    status: FeedbackStatus
 
 
 class FeedbackResult(BaseModel):
-    """Réponse retournée par POST /api/feedback."""
+    """Result returned by the Feedback Agent service."""
 
-    feedback_id: str = Field(
-        description="ID unique du feedback enregistré.",
-    )
-    response_id: str = Field(
-        description="ID de la réponse évaluée.",
-    )
-    composite_score: CompositeScore = Field(
-        description="Détail du score composite calculé.",
-    )
-    kg_updates: list[str] = Field(
-        default_factory=list,
-        description="Liste des opérations effectuées dans le KG.",
-    )
-    warnings: list[str] = Field(
-        default_factory=list,
-        description="Avertissements non-bloquants.",
-    )
+    feedback_id: str
+    response_id: str
+    composite_score: CompositeScore
+    kg_updates: list[str] = Field(default_factory=list)
+    validation_result: ValidationResult | None = Field(default=None)
+    warnings: list[str] = Field(default_factory=list)
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
     )

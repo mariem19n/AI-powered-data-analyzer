@@ -437,9 +437,9 @@ class PlanGenerator:
             analysis_step = ExecutionStep(
                 step_id="analyse_1",
                 agent=AgentType.ANALYSIS_AGENT,
-                description="Résumé descriptif et insights",
+                description="Agrégation SQL et réponse concise",
                 instruction={
-                    "task": "descriptive",
+                    "task": "aggregation",
                     "input_steps": ["sql_1"],
                     "semantic_context": ctx,
                 },

@@ -314,6 +314,7 @@ class Orchestrator:
 
         # result est un SemanticContext — le sérialiser
         ctx_dict = result.to_dict() if hasattr(result, "to_dict") else result
+        ctx_dict = self._clean_correlation_resolved_phrases(state, ctx_dict)
         state["semantic_context"] = ctx_dict
         state["semantic_hash"] = ctx_dict.get("context_hash", "")
 
@@ -405,6 +406,61 @@ class Orchestrator:
             resolution["reason"],
         )
         return state
+
+    @staticmethod
+    def _clean_correlation_resolved_phrases(
+        state: OrchestratorState,
+        ctx_dict: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Mark the exact phrase "évoluent ensemble" as resolved by correlation.
+
+        The rule is intentionally narrow: it only applies to correlation intent
+        and only removes that exact expression from semantic gaps/search hints.
+        """
+        intent = state.get("intent")
+        if not intent or intent.primary != IntentType.CORRELATION:
+            return ctx_dict
+
+        question = str(
+            state.get("raw_question") or state.get("normalized_question") or ""
+        ).lower()
+        phrase = "évoluent ensemble"
+        if phrase not in question:
+            return ctx_dict
+
+        cleaned = dict(ctx_dict)
+
+        def normalize(value: Any) -> str:
+            return " ".join(str(value or "").strip().lower().split())
+
+        def clean_list(values: Any) -> Any:
+            if not isinstance(values, list):
+                return values
+            return [item for item in values if normalize(item) != phrase]
+
+        for key in (
+            "analytic_gaps",
+            "unresolved_terms",
+            "unknown_terms",
+            "missing_context",
+            "external_search_queries",
+        ):
+            cleaned[key] = clean_list(cleaned.get(key))
+
+        tavily_query = cleaned.get("tavily_query")
+        if isinstance(tavily_query, str) and normalize(tavily_query) == phrase:
+            cleaned["tavily_query"] = ""
+
+        remaining_context_issues = any(
+            cleaned.get(key)
+            for key in ("analytic_gaps", "unresolved_terms", "unknown_terms", "missing_context")
+        )
+        if cleaned.get("needs_clarification") and not remaining_context_issues:
+            cleaned["needs_clarification"] = False
+            cleaned["clarification_reason"] = None
+
+        return cleaned
 
     @staticmethod
     def _classify_semantic_result(

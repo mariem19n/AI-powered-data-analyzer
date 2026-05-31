@@ -327,6 +327,29 @@ CREATE INDEX IF NOT EXISTS idx_agg_monthly_year_month ON agg_monthly_crypto(year
 CREATE INDEX IF NOT EXISTS idx_agg_sentiment_date ON agg_daily_sentiment(date);
 CREATE INDEX IF NOT EXISTS idx_agg_sentiment_keyword ON agg_daily_sentiment(keyword);
 
+-- Conversation history
+CREATE TABLE IF NOT EXISTS conversations (
+    id UUID PRIMARY KEY,
+    user_id TEXT NULL,
+    title VARCHAR(255) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id UUID PRIMARY KEY,
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    response_json JSONB NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_user_updated
+    ON conversations(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation_created
+    ON conversation_messages(conversation_id, created_at ASC);
+
 -- Dimensions
 CREATE INDEX IF NOT EXISTS idx_dim_crypto_symbol ON dim_crypto(symbol);
 CREATE INDEX IF NOT EXISTS idx_dim_crypto_active ON dim_crypto(is_active);

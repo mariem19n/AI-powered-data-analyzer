@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const STARTER_CHIPS = [
   "What's Bitcoin doing today?",
@@ -7,8 +7,12 @@ const STARTER_CHIPS = [
   "Show me Solana sentiment",
 ];
 
-export default function InputBar({ onSubmit, isLoading, hasMessages }) {
+export default function InputBar({ onSubmit, isLoading, hasMessages, prefillValue = "" }) {
   const [value, setValue] = useState("");
+
+  useEffect(() => {
+    if (prefillValue) setValue(prefillValue);
+  }, [prefillValue]);
 
   function submit(event) {
     event.preventDefault();

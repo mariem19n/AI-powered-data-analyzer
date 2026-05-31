@@ -222,6 +222,173 @@ register_prompt(
 )
 
 
+# ─── Prompt : aggregation ────────────────────────────────────────────────
+
+
+_AGGREGATION_SYSTEM = """\
+Tu es un analyste de données finance/crypto.
+Tu réponds à une question d'AGRÉGATION pure : moyenne, somme, minimum,
+maximum ou nombre.
+
+RÈGLES STRICTES :
+
+1. Tu ne calcules JAMAIS de nombre toi-même. Tu utilises uniquement les
+valeurs déjà présentes dans les statistiques fournies.
+
+2. La réponse doit être courte et centrée sur l'agrégat demandé :
+   - une phrase de réponse directe ;
+   - deux ou trois insights clés maximum ;
+   - une recommandation seulement si elle est réellement utile.
+   Pour un cas GDELT/sentiment, garde aussi un format court, mais utilise les
+   insights disponibles pour couvrir la définition, le résultat principal et
+   l'interprétation métier.
+
+3. N'ajoute pas d'analyse descriptive de série temporelle sauf si elle est
+explicitement demandée. Interdit dans ce prompt : tendance, pente, variation
+totale, skew, kurtosis, distribution, évolution détaillée.
+
+Exception ciblée : si la question, la métrique, la colonne ou le contexte
+contient "GDELT", "sentiment", "avg_tone" ou "tonalité", tu dois enrichir
+l'explication de l'agrégation avec une lecture du sentiment GDELT, sans changer
+de tâche. Dans ce cas uniquement, tu peux interpréter la volatilité du sentiment
+à partir de min, max et std si ces clés sont fournies.
+
+4. Chaque insight doit citer uniquement des clés existantes du dict stats dans
+`supporting_stats`.
+
+5. Langue : français. Style sobre, clair, business-friendly.
+
+6. Pour un cas GDELT/sentiment :
+   - ajoute une définition courte de GDELT et du score avg_tone ;
+   - explique que avg_tone > 0 indique une tonalité plutôt positive,
+     avg_tone < 0 une tonalité plutôt négative, et une valeur proche de 0
+     (entre -0.2 et 0.2) un sentiment globalement neutre ou équilibré ;
+   - interprète la moyenne, puis min/max/std si disponibles ;
+   - n'invente aucun événement externe, ne mentionne pas Tavily, WEB,
+     TradingView, Reuters ou des sources externes, et ne donne pas de conseil
+     financier.
+
+7. Tu réponds UNIQUEMENT avec le JSON conforme au schéma demandé.
+"""
+
+
+def _build_aggregation_user(
+    *,
+    stats: dict[str, Any],
+    question: str | None = None,
+    requested_metric: str | None = None,
+    aggregate_type: str | None = None,
+    aggregate_value: Any = None,
+    time_period: str | None = None,
+    row_count: int | None = None,
+    sql_result_summary: dict[str, Any] | None = None,
+    unit: str | None = None,
+    warnings: list[str] | None = None,
+    **_: Any,
+) -> str:
+    """
+    Construit le prompt utilisateur pour une agrégation pure.
+
+    Les nombres sont déjà calculés par SQL/Python. Le LLM doit seulement les
+    expliquer, sans les recomposer ni extrapoler.
+    """
+    compact_context = {
+        "question": question or stats.get("question"),
+        "requested_metric": requested_metric or stats.get("metric"),
+        "aggregate_type": aggregate_type or stats.get("aggregate_type"),
+        "aggregate_value": aggregate_value if aggregate_value is not None else stats.get("aggregate_value"),
+        "formatted_value": stats.get("formatted_value"),
+        "unit": unit or stats.get("unit"),
+        "time_period": time_period or stats.get("time_period"),
+        "row_count": row_count if row_count is not None else stats.get("row_count"),
+        "calculation_method": stats.get("calculation_method"),
+        "start_date": stats.get("start_date"),
+        "end_date": stats.get("end_date"),
+        "value_col": stats.get("value_col"),
+    }
+
+    sentiment_probe = " ".join(
+        str(value).lower()
+        for value in (
+            compact_context.get("question"),
+            compact_context.get("requested_metric"),
+            compact_context.get("value_col"),
+            compact_context.get("calculation_method"),
+            json.dumps(sql_result_summary or stats, ensure_ascii=False, default=str),
+        )
+        if value is not None
+    )
+    is_gdelt_sentiment = any(
+        keyword in sentiment_probe
+        for keyword in ("gdelt", "sentiment", "avg_tone", "tonalité", "tonalite")
+    )
+
+    parts: list[str] = []
+    parts.append("# Question utilisateur")
+    parts.append(str(compact_context["question"] or ""))
+
+    parts.append("\n# Contexte d'agrégation")
+    parts.append("```json")
+    parts.append(json.dumps(compact_context, indent=2, ensure_ascii=False, default=str))
+    parts.append("```")
+
+    parts.append("\n# Statistiques pré-calculées autorisées")
+    parts.append("```json")
+    parts.append(_format_stats_block(sql_result_summary or stats))
+    parts.append("```")
+
+    parts.append("\n# Warnings produits par la couche statistique")
+    parts.append(_format_warnings_block(warnings))
+
+    if is_gdelt_sentiment:
+        parts.append("\n# Règle spécifique : sentiment GDELT / avg_tone")
+        parts.append(
+            "Cette agrégation concerne le sentiment GDELT. GDELT est une base "
+            "mondiale d'actualités et d'événements qui permet d'analyser le "
+            "ton médiatique associé à un sujet. Dans ce projet, le score "
+            "avg_tone représente la tonalité moyenne des actualités liées au "
+            "Bitcoin ou aux cryptomonnaies.\n\n"
+            "Interprète les valeurs déjà calculées : avg_tone > 0 signifie une "
+            "tonalité plutôt positive, avg_tone < 0 une tonalité plutôt "
+            "négative, et une valeur entre -0.2 et 0.2 un sentiment globalement "
+            "neutre ou équilibré. Si min, max ou std sont disponibles, utilise-les "
+            "pour expliquer si le sentiment médiatique est stable, volatil ou "
+            "contrasté. Si la moyenne est proche de 0 mais que min/max sont "
+            "éloignés, explique qu'il n'y a pas de tendance moyenne forte mais "
+            "qu'il existe des épisodes ponctuels positifs ou négatifs.\n\n"
+            "Structure attendue, en restant dans un format court : "
+            "1) définition courte, 2) résultat principal avec moyenne et "
+            "interprétation, 3) points clés sur min/max/std et nombre "
+            "d'observations avec une conclusion métier sur la perception "
+            "médiatique. Ne te limite pas aux statistiques brutes."
+        )
+
+    parts.append("")
+    if is_gdelt_sentiment:
+        parts.append(
+            "Produis un JSON avec des insights courts mais interprétatifs : "
+            "définition GDELT/avg_tone, résultat principal, points clés et "
+            "conclusion métier. N'invente aucun événement externe."
+        )
+    else:
+        parts.append(
+            "Produis un JSON avec une réponse directe en premier insight, puis "
+            "2 insights courts maximum sur la méthode, la période et le nombre "
+            "d'observations. Ne mentionne aucun indicateur de tendance ou de "
+            "distribution."
+        )
+    return "\n".join(parts)
+
+
+register_prompt(
+    PromptTemplate(
+        task_name="aggregation",
+        system=_AGGREGATION_SYSTEM,
+        build_user=_build_aggregation_user,
+    )
+)
+
+
 # ─── Prompt : external_summary ────────────────────────────────────────────
 
 
@@ -711,6 +878,122 @@ register_prompt(
         task_name="anomaly_detection",
         system=_ANOMALY_DETECTION_SYSTEM,
         build_user=_build_anomaly_detection_user,
+    )
+)
+
+
+# ─── Prompt : comparison ──────────────────────────────────────────────────
+
+
+_COMPARISON_SYSTEM = """\
+Tu es un analyste de données spécialisé en marchés crypto et finance.
+Tu interprètes des statistiques de comparaison PRÉ-CALCULÉES entre plusieurs
+séries numériques alignées par date.
+
+RÈGLES STRICTES — NON NÉGOCIABLES :
+
+1. Tu réponds uniquement en français, dans un style business-friendly,
+clair, concis et non technique quand c'est possible.
+
+2. Tu ne calcules JAMAIS toi-même. Toutes les valeurs numériques citées
+doivent venir littéralement du dict de stats fourni. Tu peux reformuler
+et arrondir légèrement pour la lisibilité, mais tu ne dois inventer aucune
+valeur et ne dois pas produire de nouveau calcul.
+
+3. Tu bases tes insights uniquement sur les statistiques et warnings fournis.
+Si une information n'est pas présente, tu ne la mentionnes pas.
+
+4. Structure attendue des insights :
+   - conclusion comparative principale ;
+   - différence quantifiée ;
+   - interprétation métier de ce que signifie l'écart ;
+   - limite ou prudence si pertinente.
+
+5. Pour une comparaison de volumes crypto en unités natives, ajoute une
+prudence explicite si applicable :
+"À noter : cette comparaison utilise les volumes en unités crypto. Pour
+comparer la liquidité économique réelle, un volume converti en USD serait
+plus pertinent."
+
+6. `supporting_stats` doit contenir uniquement des clés existantes dans le
+dict de stats fourni. Clés typiques disponibles : "metric", "start_date",
+"end_date", "aligned_points", "symbols", "metrics_by_symbol",
+"average_volume_pct_diff", "higher_volume_asset".
+
+7. Recommendations : produis séparément 2 à 3 recommandations pratiques,
+par exemple comparer les volumes normalisés en USD, inspecter les dates où
+les séries divergent fortement, ou surveiller l'actif dominant pour les
+signaux de liquidité. Elles doivent rester analytiques, jamais prescriptives
+d'achat/vente.
+
+8. Si les warnings indiquent des données manquantes, vides ou trop peu de
+points alignés, mentionne la limite dans un insight avec une confidence plus
+faible.
+
+9. Tu réponds UNIQUEMENT avec le JSON conforme au schéma demandé.
+"""
+
+
+def _build_comparison_user(
+    *,
+    stats: dict[str, Any],
+    question: str = "",
+    symbols: list[str] | None = None,
+    metric: str = "",
+    time_period: str = "",
+    comparison_stats: dict[str, Any] | None = None,
+    warnings: list[str] | None = None,
+    **_: Any,
+) -> str:
+    """Construit le prompt user pour la task comparison."""
+    stats_block = comparison_stats or stats
+    symbols = symbols or stats_block.get("symbols") or []
+    metric = metric or str(stats_block.get("metric") or "")
+
+    parts: list[str] = []
+
+    parts.append("# Question utilisateur")
+    parts.append(question or "(question non fournie)")
+
+    parts.append("\n# Contexte de comparaison")
+    if symbols:
+        parts.append(f"- Séries comparées : {', '.join(map(str, symbols))}")
+    if metric:
+        parts.append(f"- Métrique comparée : {metric}")
+    if time_period:
+        parts.append(f"- Période : {time_period}")
+
+    parts.append("\n# Statistiques de comparaison pré-calculées")
+    parts.append("```json")
+    parts.append(_format_stats_block(stats_block))
+    parts.append("```")
+
+    parts.append("\n# Warnings")
+    parts.append(_format_warnings_block(warnings))
+
+    parts.append("\nProduis un JSON conforme au schéma :")
+    parts.append("- 3 à 4 insights maximum, rédigés comme une analyse client.")
+    parts.append(
+        "- Les insights doivent couvrir : conclusion principale, écart chiffré, "
+        "interprétation métier, prudence éventuelle."
+    )
+    parts.append(
+        "- Pour les volumes BTC/ETH ou autres crypto en unités natives, inclure "
+        "la prudence sur la conversion USD si le dict indique metric='volume'."
+    )
+    parts.append(
+        "- Recommendations : 2 à 3 actions pratiques, séparées des insights, "
+        "avec priorité low/medium/high."
+    )
+
+    return "\n".join(parts)
+
+
+register_prompt(
+    PromptTemplate(
+        task_name="comparison",
+        system=_COMPARISON_SYSTEM,
+        build_user=_build_comparison_user,
     )
 )
 

@@ -241,13 +241,22 @@ class SQLTemplateEngine:
             if col and val:
                 conditions.append(f"{col} = '{val}'")
         else:
+            grouped_values: dict[str, list[str]] = {}
             for ef in entity_filters:
                 col = ef.get("column", "")
                 val = ef.get("value", "")
                 tbl = ef.get("table", "")
                 # Appliquer le filtre seulement si c'est la bonne table
                 if col and val and (not tbl or tbl == table_name):
-                    conditions.append(f"{col} = '{val}'")
+                    grouped_values.setdefault(col, [])
+                    if val not in grouped_values[col]:
+                        grouped_values[col].append(val)
+            for col, values in grouped_values.items():
+                if len(values) == 1:
+                    conditions.append(f"{col} = '{values[0]}'")
+                elif len(values) > 1:
+                    quoted = ", ".join(f"'{value}'" for value in values)
+                    conditions.append(f"{col} IN ({quoted})")
 
         # Time filters
         for tf in time_filters:

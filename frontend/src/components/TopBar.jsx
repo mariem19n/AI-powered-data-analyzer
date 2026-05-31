@@ -1,4 +1,4 @@
-export default function TopBar({ onToggleSidebar }) {
+export default function TopBar({ onToggleSidebar, title = "Crypto Market Assistant" }) {
   return (
     <header className="topbar">
       <button
@@ -9,7 +9,7 @@ export default function TopBar({ onToggleSidebar }) {
       >
         ☰
       </button>
-      <span className="topbar-title">Crypto Market Assistant</span>
+      <span className="topbar-title">{title}</span>
     </header>
   );
 }

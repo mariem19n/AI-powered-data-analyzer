@@ -152,6 +152,29 @@ _TEMPORAL_MODIFIERS = re.compile(
     re.IGNORECASE,
 )
 
+_CRYPTO_SYMBOL_ALIASES: dict[str, str] = {
+    "btc": "BTC",
+    "bitcoin": "BTC",
+    "eth": "ETH",
+    "ethereum": "ETH",
+    "sol": "SOL",
+    "solana": "SOL",
+    "xrp": "XRP",
+    "ripple": "XRP",
+    "ada": "ADA",
+    "cardano": "ADA",
+    "dot": "DOT",
+    "polkadot": "DOT",
+    "doge": "DOGE",
+    "dogecoin": "DOGE",
+    "avax": "AVAX",
+    "avalanche": "AVAX",
+    "link": "LINK",
+    "chainlink": "LINK",
+    "ltc": "LTC",
+    "litecoin": "LTC",
+}
+
 
 # =====================================================================
 # ConversationContextResolver
@@ -390,6 +413,25 @@ class ConversationContextResolver:
                 resolved_question=resolved,
             )
 
+        explicit_symbols = _extract_crypto_symbols(stripped)
+        if (
+            last.intent == "comparison"
+            and len(explicit_symbols) >= 2
+            and (
+                stripped.lower().startswith("compare ")
+                or stripped.lower().startswith("et ")
+                or "aussi" in stripped.lower()
+            )
+        ):
+            resolved = self._build_comparison_follow_up(last, explicit_symbols)
+            return FollowUpDetection(
+                is_follow_up=True,
+                confidence=0.95,
+                method="rule",
+                rule_matched="comparison_symbol_replacement",
+                resolved_question=resolved,
+            )
+
         # ── Règle 3 : question très courte sans verbe d'action ─
         words = stripped.split()
         if (
@@ -434,6 +476,13 @@ class ConversationContextResolver:
              + new_entity="Ethereum"
              → "Prévois le prix de Ethereum pour les 7 prochains jours"
         """
+        explicit_symbols = _extract_crypto_symbols(new_entity)
+        if last_turn.intent == "comparison" and len(explicit_symbols) >= 2:
+            return ConversationContextResolver._build_comparison_follow_up(
+                last_turn,
+                explicit_symbols,
+            )
+
         resolved = last_turn.resolved_question
 
         if last_turn.entities:
@@ -462,6 +511,24 @@ class ConversationContextResolver:
 
         # Dernier recours : concaténation simple
         return f"{resolved} — appliqué à {new_entity}"
+
+    @staticmethod
+    def _build_comparison_follow_up(
+        last_turn: TurnContext,
+        symbols: list[str],
+    ) -> str:
+        metric_label = last_turn.metric or "prix"
+        if metric_label in {"volume", "volume_24h"}:
+            metric_text = "volumes"
+        elif metric_label in {"close_usd", "price", "prix"}:
+            metric_text = "prix"
+        else:
+            metric_text = metric_label
+
+        entity_text = " et ".join(symbols)
+        if last_turn.time_context:
+            return f"Compare les {metric_text} de {entity_text} sur {last_turn.time_context}"
+        return f"Compare les {metric_text} de {entity_text}"
 
     @staticmethod
     def _substitute_time(last_turn: TurnContext, new_time: str) -> str:
@@ -585,6 +652,17 @@ class ConversationContextResolver:
 # =====================================================================
 # Helper — Extraction des entités depuis le SemanticContext
 # =====================================================================
+
+
+def _extract_crypto_symbols(text: str) -> list[str]:
+    """Extract explicit crypto symbols/names from short follow-up text."""
+    found: list[str] = []
+    lowered = text.lower()
+    for alias, symbol in _CRYPTO_SYMBOL_ALIASES.items():
+        if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", lowered):
+            if symbol not in found:
+                found.append(symbol)
+    return found
 
 
 def extract_turn_metadata(

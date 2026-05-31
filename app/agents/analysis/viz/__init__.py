@@ -19,6 +19,7 @@ from app.agents.analysis.viz import line_chart  # noqa: F401
 from app.agents.analysis.viz import scatter_plot  # noqa: F401
 from app.agents.analysis.viz import heatmap  # noqa: F401
 from app.agents.analysis.viz import forecast_chart  # noqa: F401
+from app.agents.analysis.viz import aggregation_chart  # noqa: F401
 
 # API publique du sous-package.
 from app.agents.analysis.viz.templates import (

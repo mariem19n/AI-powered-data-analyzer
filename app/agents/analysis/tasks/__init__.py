@@ -16,9 +16,11 @@ Pour ajouter une nouvelle task :
 # Imports de side-effect : chacun enregistre sa task via @register_task.
 # noqa: F401 — imports volontairement non-utilisés directement.
 from app.agents.analysis.tasks import descriptive  # noqa: F401
+from app.agents.analysis.tasks import aggregation  # noqa: F401
 from app.agents.analysis.tasks import external_summary  # noqa: F401
 from app.agents.analysis.tasks import hybrid_summary  # noqa: F401
 from app.agents.analysis.tasks import anomaly_detection  # noqa: F401  
+from app.agents.analysis.tasks import comparison  # noqa: F401
 from app.agents.analysis.tasks import correlation  # noqa: F401
 from app.agents.analysis.tasks import forecasting 
 
